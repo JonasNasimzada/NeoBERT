@@ -4,7 +4,6 @@ __all__ = [
     "NeoBERTLMHead",
     "NeoBERT",
     "NeoBERTConfig",
-    "NomicBERTForSequenceClassification",
 ]
 
 from .model import (
@@ -13,5 +12,4 @@ from .model import (
     NeoBERTLMHead,
     NeoBERT,
     NeoBERTConfig,
-    NomicBERTForSequenceClassification,
 )

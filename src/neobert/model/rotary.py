@@ -84,3 +84,13 @@ def apply_rotary_emb(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def apply_rotary_emb_complex(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_real, k_real = apply_rotary_emb(xq.real.contiguous(), xk.real.contiguous(), freqs_cis)
+    q_imag, k_imag = apply_rotary_emb(xq.imag.contiguous(), xk.imag.contiguous(), freqs_cis)
+    return torch.complex(q_real, q_imag).to(xq.dtype), torch.complex(k_real, k_imag).to(xk.dtype)

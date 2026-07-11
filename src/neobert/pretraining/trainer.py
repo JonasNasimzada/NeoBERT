@@ -277,7 +277,7 @@ def trainer(cfg: DictConfig):
                             file_to_remove = iterations.pop(0)
                             shutil.rmtree(os.path.join(model_checkpoint_dir, str(file_to_remove)))
                             print(
-                                f"Deleted old model checkpoint {file_to_remove} due to limit " f"(max_ckpt = {cfg.trainer.model.max_ckpt})"
+                                 f"Deleted old model checkpoint {file_to_remove} due to limit " f"(max_ckpt = {cfg.trainer.model.max_ckpt})"
                             )
                     # Save the checkpoint
                     if accelerator.distributed_type is DistributedType.DEEPSPEED:

@@ -15,7 +15,11 @@ from torch.nn.functional import scaled_dot_product_attention
 from typing import Any, Dict, List, Optional
 from functools import partial
 
-from xformers.ops import SwiGLU, memory_efficient_attention
+try:
+    from xformers.ops import SwiGLU, memory_efficient_attention
+except ImportError:
+    SwiGLU = None
+    memory_efficient_attention = None
 
 from datasets import Dataset
 
@@ -24,8 +28,90 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 
 from tqdm import tqdm
 
+from .complex_attention import NeoBERTComplexAttention
 from .rmsnorm import RMSNorm
 from .rotary import precompute_freqs_cis, apply_rotary_emb
+
+
+def _prepare_attention_masks(pad_mask, num_heads, seq_len):
+    if pad_mask is None:
+        return None, None
+    if pad_mask.dim() != 2:
+        raise ValueError("pad_mask must have shape (batch, sequence)")
+
+    if pad_mask.dtype == torch.bool or not torch.is_floating_point(pad_mask):
+        valid_tokens = pad_mask.bool()
+        key_padding_mask = valid_tokens.logical_not()
+        additive_mask = torch.zeros(
+            pad_mask.shape,
+            dtype=torch.float32,
+            device=pad_mask.device,
+        ).masked_fill(key_padding_mask, float("-inf"))
+    elif bool((pad_mask == 1).any()):
+        valid_tokens = pad_mask > 0
+        key_padding_mask = valid_tokens.logical_not()
+        additive_mask = torch.zeros_like(pad_mask).masked_fill(key_padding_mask, float("-inf"))
+    else:
+        additive_mask = pad_mask
+        key_padding_mask = additive_mask.isfinite().logical_not() | (additive_mask < 0)
+
+    attention_bias = additive_mask[:, None, None, :].expand(-1, num_heads, seq_len, -1).contiguous()
+    return attention_bias, key_padding_mask
+
+
+def _real_attention(
+    query,
+    key,
+    value,
+    attn_bias,
+    key_padding_mask,
+    config,
+    scale=None,
+    backend=None,
+):
+    backend = config.attention_backend if backend is None else backend
+    if backend == "auto":
+        use_xformers = config.flash_attention and query.is_cuda and memory_efficient_attention is not None
+        backend = "xformers" if use_xformers else "torch"
+    if backend == "xformers":
+        if memory_efficient_attention is None:
+            raise RuntimeError("attention_backend='xformers' requires an installed xFormers package")
+        bias = None if attn_bias is None else attn_bias.to(dtype=query.dtype, device=query.device)
+        return memory_efficient_attention(
+            query=query,
+            key=key,
+            value=value,
+            attn_bias=bias,
+            p=0.0,
+            scale=scale,
+        )
+    if backend == "flash":
+        try:
+            from complex_attention import efficient_attention
+        except ImportError as error:
+            raise ImportError(
+                "Install ComplexAttention before using attention_backend='flash'"
+            ) from error
+        return efficient_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            key_padding_mask=key_padding_mask,
+            scale=scale,
+            backend="flash",
+        ).transpose(1, 2)
+    if backend != "torch":
+        raise ValueError(f"unsupported real attention backend: {backend}")
+
+    bias = None if attn_bias is None else attn_bias.to(dtype=query.dtype, device=query.device)
+    return scaled_dot_product_attention(
+        query=query.transpose(1, 2),
+        key=key.transpose(1, 2),
+        value=value.transpose(1, 2),
+        attn_mask=bias,
+        dropout_p=0.0,
+        scale=scale,
+    ).transpose(1, 2)
 
 
 class NeoBERTConfig(PretrainedConfig):
@@ -49,6 +135,11 @@ class NeoBERTConfig(PretrainedConfig):
         pad_token_id: int = 0,
         max_length: int = 1024,
         flash_attention: bool = True,
+        attention_space: str = "real",
+        attention_backend: str = "auto",
+        attention_spaces: Optional[List[str]] = None,
+        attention_backends: Optional[List[str]] = None,
+        dual_tangent_chunk_size: int = 128,
         base_scale: float = 1.0 / (960.0**0.5),
         ngpt: bool = False,
         **kwargs,
@@ -73,6 +164,40 @@ class NeoBERTConfig(PretrainedConfig):
         self.pad_token_id = pad_token_id
         self.max_length = max_length
         self.flash_attention = flash_attention
+        valid_spaces = ("real", "complex", "split", "dual")
+        valid_backends = ("auto", "native", "reference", "torch", "xformers", "flash")
+        if attention_space not in valid_spaces:
+            raise ValueError("attention_space must be 'real', 'complex', 'split', or 'dual'")
+        if attention_backend not in valid_backends:
+            raise ValueError(
+                "attention_backend must be 'auto', 'native', 'reference', 'torch', 'xformers', or 'flash'"
+            )
+        if dual_tangent_chunk_size <= 0:
+            raise ValueError("dual_tangent_chunk_size must be positive")
+        if attention_spaces is None:
+            attention_spaces = [attention_space] * num_hidden_layers
+        if attention_backends is None:
+            attention_backends = [attention_backend] * num_hidden_layers
+        if len(attention_spaces) != num_hidden_layers:
+            raise ValueError("attention_spaces must contain one value per hidden layer")
+        if len(attention_backends) != num_hidden_layers:
+            raise ValueError("attention_backends must contain one value per hidden layer")
+        if any(space not in valid_spaces for space in attention_spaces):
+            raise ValueError("attention_spaces contains an unknown scalar space")
+        if any(backend not in valid_backends for backend in attention_backends):
+            raise ValueError("attention_backends contains an unknown backend")
+        for layer_space, layer_backend in zip(attention_spaces, attention_backends):
+            if layer_space == "real" and layer_backend in ("native", "reference"):
+                raise ValueError("real layers support auto, torch, xformers, or flash")
+            if layer_space == "complex" and layer_backend in ("native", "reference"):
+                raise ValueError("ordinary complex layers support auto, torch, xformers, or flash")
+            if layer_space == "split" and layer_backend == "reference":
+                raise ValueError("split-complex layers do not use attention_backend='reference'")
+        self.attention_space = attention_space
+        self.attention_backend = attention_backend
+        self.attention_spaces = list(attention_spaces)
+        self.attention_backends = list(attention_backends)
+        self.dual_tangent_chunk_size = dual_tangent_chunk_size
         self.base_scale = base_scale
         self.ngpt = ngpt
         self.kwargs = kwargs
@@ -81,19 +206,34 @@ class NeoBERTConfig(PretrainedConfig):
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
 
-    def __init__(self, config: NeoBERTConfig):
+    def __init__(self, config: NeoBERTConfig, layer_index: int):
         super().__init__()
 
         self.config = config
+        self.layer_index = layer_index
+        self.attention_space = config.attention_spaces[layer_index]
+        self.attention_backend = config.attention_backends[layer_index]
 
         # Attention
-        self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
-        self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+        if self.attention_space == "real":
+            self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
+            self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+            self.complex_attention = None
+        else:
+            self.qkv = None
+            self.wo = None
+            self.complex_attention = NeoBERTComplexAttention(
+                config,
+                self.attention_space,
+                self.attention_backend,
+            )
         self.resid_dropout = nn.Dropout(config.dropout)
 
         # Feedforward network
         match config.hidden_act.lower():
             case "swiglu":
+                if SwiGLU is None:
+                    raise RuntimeError("hidden_act='SwiGLU' requires an installed xFormers package")
                 # To keep the number of parameters and the amount of computation constant, we reduce the number of
                 # hidden units by a factor of 2/3 (https://arxiv.org/pdf/2002.05202.pdf) and make it a multiple of 8 to
                 # avoid RuntimeError due to misaligned operand
@@ -117,12 +257,29 @@ class EncoderBlock(nn.Module):
 
         self.ffn_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
-        x = x + self._att_block(self.attention_norm(x), pad_mask, freqs_cis)
+    def forward(
+        self,
+        x: torch.Tensor,
+        pad_mask: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        key_padding_mask: torch.Tensor = None,
+    ):
+        x = x + self._att_block(self.attention_norm(x), pad_mask, freqs_cis, key_padding_mask)
         x = x + self._ff_block(self.ffn_norm(x))
         return x
 
-    def _att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+    def _att_block(
+        self,
+        x: torch.Tensor,
+        pad_mask: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        key_padding_mask: torch.Tensor = None,
+    ):
+        if self.complex_attention is not None:
+            return self.resid_dropout(
+                self.complex_attention(x, pad_mask, key_padding_mask, freqs_cis)
+            )
+
         batch_size, seq_len, _ = x.shape
 
         xq, xk, xv = self.qkv(x).view(batch_size, seq_len, self.config.num_attention_heads, self.config.dim_head * 3).chunk(3, axis=-1)
@@ -130,17 +287,15 @@ class EncoderBlock(nn.Module):
         if self.config.rope:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
-        if self.config.flash_attention:
-            attn = memory_efficient_attention(query=xq, key=xk, value=xv, attn_bias=pad_mask, p=0)
-        else:
-            # Input and output are of dimension (B, H, M, K)
-            attn = scaled_dot_product_attention(
-                query=xq.transpose(1, 2),
-                key=xk.transpose(1, 2),
-                value=xv.transpose(1, 2),
-                attn_mask=pad_mask,
-                dropout_p=self.config.dropout_prob if self.training else 0,
-            ).transpose(1, 2)
+        attn = _real_attention(
+            xq,
+            xk,
+            xv,
+            pad_mask,
+            key_padding_mask,
+            self.config,
+            backend=self.attention_backend,
+        )
 
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head)))
 
@@ -151,10 +306,15 @@ class EncoderBlock(nn.Module):
 class NormEncoderBlock(nn.Module):
     """Transformer encoder block."""
 
-    def __init__(self, config: NeoBERTConfig):
+    def __init__(self, config: NeoBERTConfig, layer_index: int):
         super().__init__()
 
         self.config = config
+        self.layer_index = layer_index
+        self.attention_space = config.attention_spaces[layer_index]
+        self.attention_backend = config.attention_backends[layer_index]
+        if self.attention_space != "real":
+            raise ValueError("complex attention schedules currently require ngpt=False")
 
         # Attention
         self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
@@ -187,8 +347,14 @@ class NormEncoderBlock(nn.Module):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
 
-    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
-        x_attn = self._att_block(x, pad_mask, freqs_cis)
+    def forward(
+        self,
+        x: torch.Tensor,
+        pad_mask: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        key_padding_mask: torch.Tensor = None,
+    ):
+        x_attn = self._att_block(x, pad_mask, freqs_cis, key_padding_mask)
 
         lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
         lr = torch.abs(lr)
@@ -208,7 +374,13 @@ class NormEncoderBlock(nn.Module):
 
         return x
 
-    def _att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+    def _att_block(
+        self,
+        x: torch.Tensor,
+        pad_mask: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        key_padding_mask: torch.Tensor = None,
+    ):
         batch_size, seq_len, _ = x.shape
 
         xq, xk, xv = self.qkv(x).view(batch_size, seq_len, self.config.num_attention_heads, self.config.dim_head * 3).chunk(3, axis=-1)
@@ -224,18 +396,16 @@ class NormEncoderBlock(nn.Module):
 
         softmax_scale = (self.config.hidden_size / self.config.num_attention_heads) ** 0.5
 
-        if self.config.flash_attention:
-            attn = memory_efficient_attention(query=xq, key=xk, value=xv, attn_bias=pad_mask, p=0, scale=softmax_scale)
-        else:
-            # Input and output are of dimension (B, H, M, K)
-            attn = scaled_dot_product_attention(
-                query=xq.transpose(1, 2),
-                key=xk.transpose(1, 2),
-                value=xv.transpose(1, 2),
-                attn_mask=pad_mask,
-                dropout_p=self.config.dropout_prob if self.training else 0,
-                scale=softmax_scale,
-            ).transpose(1, 2)
+        attn = _real_attention(
+            xq,
+            xk,
+            xv,
+            pad_mask,
+            key_padding_mask,
+            self.config,
+            scale=softmax_scale,
+            backend=self.attention_backend,
+        )
 
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.hidden_size)))
 
@@ -280,8 +450,8 @@ class NeoBERT(NeoBERTPreTrainedModel):
             self.positional_embedding = nn.Embedding(config.max_length + 1, config.hidden_size, padding_idx=config.pad_token_id)
 
         self.transformer_encoder = nn.ModuleList()
-        for _ in range(config.num_hidden_layers):
-            self.transformer_encoder.append(EncoderBlock(config))
+        for layer_index in range(config.num_hidden_layers):
+            self.transformer_encoder.append(EncoderBlock(config, layer_index))
 
         self.layer_norm = (
             RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
@@ -291,10 +461,11 @@ class NeoBERT(NeoBERTPreTrainedModel):
         self.post_init()
 
     def forward(self, src, pad_mask=None):
-        # Expand and repeat: (Batch, Length) -> (Batch, Heads, Length, Length)
-        if pad_mask is not None:
-            assert pad_mask.dtype != torch.bool and 1.0 not in pad_mask, "NeoBERT expects an additive pad_mask"
-            pad_mask = pad_mask.unsqueeze(1).unsqueeze(1).repeat(1, self.config.num_attention_heads, pad_mask.size(-1), 1)
+        pad_mask, key_padding_mask = _prepare_attention_masks(
+            pad_mask,
+            self.config.num_attention_heads,
+            src.shape[1],
+        )
 
         # RoPE
         freqs_cis = None
@@ -314,7 +485,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
 
         # Transformer encoder
         for layer in self.transformer_encoder:
-            x = layer(x, pad_mask, freqs_cis)
+            x = layer(x, pad_mask, freqs_cis, key_padding_mask)
 
         # Final normalization layer
         x = self.layer_norm(x)
@@ -339,8 +510,8 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
             self.positional_embedding = nn.Embedding(config.max_length + 1, config.hidden_size, padding_idx=config.pad_token_id)
 
         self.transformer_encoder = nn.ModuleList()
-        for _ in range(config.num_hidden_layers):
-            self.transformer_encoder.append(NormEncoderBlock(config))
+        for layer_index in range(config.num_hidden_layers):
+            self.transformer_encoder.append(NormEncoderBlock(config, layer_index))
 
         self.layer_norm = (
             RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
@@ -358,10 +529,11 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
         self.sz = torch.nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=torch.float32))
 
     def forward(self, src, pad_mask=None):
-        # Expand and repeat: (Batch, Length) -> (Batch, Heads, Length, Length)
-        if pad_mask is not None:
-            assert pad_mask.dtype != torch.bool and 1.0 not in pad_mask, "NeoBERT expects an additive pad_mask"
-            pad_mask = pad_mask.unsqueeze(1).unsqueeze(1).repeat(1, self.config.num_attention_heads, pad_mask.size(-1), 1)
+        pad_mask, key_padding_mask = _prepare_attention_masks(
+            pad_mask,
+            self.config.num_attention_heads,
+            src.shape[1],
+        )
 
         # RoPE
         freqs_cis = None
@@ -381,7 +553,7 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
 
         # Transformer encoder
         for layer in self.transformer_encoder:
-            x = layer(x, pad_mask, freqs_cis)
+            x = layer(x, pad_mask, freqs_cis, key_padding_mask)
 
         # Return the output of the last hidden layer
         return x
