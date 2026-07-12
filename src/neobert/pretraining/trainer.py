@@ -33,37 +33,35 @@ def to_target_batch_size(
     stored_batch: BatchEncoding,
     target_size: int = 8,
 ):
-    tmp = {}
+    if stored_batch:
+        if batch.keys() != stored_batch.keys():
+            raise ValueError("stored and current batches must contain the same fields")
+        batch = {
+            key: torch.cat((stored_batch[key].to(value.device), value), dim=0)
+            for key, value in batch.items()
+        }
+
     batch_size = batch["input_ids"].shape[0]
+    if batch_size <= target_size:
+        return batch, {}
 
-    # If the batch is to large, we store samples
-    if batch_size > target_size:
-        for key in batch.keys():
-            tmp[key] = torch.split(batch[key], [target_size, batch_size - target_size], dim=0)
-            batch[key] = tmp[key][0]
-            stored_batch[key] = tmp[key][1] if stored_batch[key] is None else torch.cat([tmp[key][1], stored_batch[key]], dim=0)
+    output = {}
+    remainder = {}
+    for key, value in batch.items():
+        output[key], remainder[key] = value.split(
+            (target_size, batch_size - target_size),
+            dim=0,
+        )
+        remainder[key] = remainder[key].cpu()
+    return output, remainder
 
-    # If the batch is to small, we fetch stored samples
-    elif batch_size < target_size and stored_batch["input_ids"] is not None:
-        stored_batch_size = stored_batch["input_ids"].shape[0]
-        missing = target_size - batch_size
 
-        # Fetch only necessary samples if storage is larger than required
-        if missing < stored_batch_size:
-            for key in batch.keys():
-                stored_batch[key].to(batch[key].device)
-                tmp[key] = torch.split(stored_batch[key], [missing, stored_batch_size - missing], dim=0)
-                batch[key] = torch.cat([batch[key], tmp[key][0]], dim=0)
-                stored_batch[key] = tmp[key][1]
-                stored_batch[key].to("cpu", non_blocking=True)
-
-        # Concatenate otherwise
-        else:
-            for key in batch.keys():
-                batch[key] = torch.cat([batch[key], stored_batch[key]], dim=0)
-                stored_batch[key] = None
-
-    return batch, stored_batch
+def count_batch_tokens(batch: BatchEncoding) -> int:
+    if "document_ids" in batch:
+        return (batch["document_ids"] >= 0).sum().item()
+    if "attention_mask" in batch:
+        return (batch["attention_mask"] == 0).sum().item()
+    return batch["input_ids"].numel()
 
 
 def trainer(cfg: DictConfig):
@@ -140,7 +138,22 @@ def trainer(cfg: DictConfig):
 
     # Model
     model = NeoBERTLMHead(NeoBERTConfig(**cfg.model, **cfg.tokenizer, pad_token_id=tokenizer.pad_token_id))
-    accelerator.log({"model_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad)})
+    embedding = model.model.encoder.weight
+    accelerator.log(
+        {
+            "model/parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "model/non_embedding_parameters": sum(
+                p.numel()
+                for p in model.parameters()
+                if p.requires_grad and p is not embedding
+            ),
+        }
+    )
+    if cfg.trainer.get("compile", False):
+        model = torch.compile(
+            model,
+            fullgraph=cfg.trainer.get("compile_fullgraph", False),
+        )
 
     # Optimizer and Scheduler
     optimizer = get_optimizer(model, accelerator.distributed_type, name=cfg.optimizer.name, **cfg.optimizer.hparams)
@@ -177,11 +190,7 @@ def trainer(cfg: DictConfig):
         # Use skipped_train_dataloader the first epoch after resuming
         dataloader = train_dataloader if skipped_train_dataloader is None else skipped_train_dataloader
 
-        stored_batch = {
-            "input_ids": None,
-            "attention_mask": None,
-            "labels": None,
-        }
+        stored_batch = {}
         i = 0
         for batch in dataloader:
             # Update number of batches
@@ -203,7 +212,11 @@ def trainer(cfg: DictConfig):
             if metrics["train/batches"] % cfg.trainer.gradient_accumulation_steps != 0:
                 with accelerator.no_sync(model):
                     # Forward pass
-                    logits = model(batch["input_ids"], batch.get("attention_mask", None))["logits"]
+                    logits = model(
+                        batch["input_ids"],
+                        batch.get("attention_mask"),
+                        batch.get("document_ids"),
+                    )["logits"]
                     train_loss = train_loss_fn(logits.view(-1, cfg.tokenizer.vocab_size), batch["labels"].view(-1))
 
                     # Compute gradient
@@ -211,17 +224,18 @@ def trainer(cfg: DictConfig):
 
                     # Log metrics
                     metrics["train/local_samples"] += batch["input_ids"].shape[0]
-                    if "attention_mask" in batch.keys():
-                        metrics["train/local_tokens"] += (batch["attention_mask"] == 0).sum().item()
-                    else:
-                        metrics["train/local_tokens"] += batch["input_ids"].shape[1]
+                    metrics["train/local_tokens"] += count_batch_tokens(batch)
                     metrics["train/local_num_pred"] += (batch["labels"] != -100).sum().item()
                     metrics["train/local_sum_loss"] += train_loss.item() * (batch["labels"] != -100).sum().item()
                     metrics["train/local_num_correct"] += (logits.argmax(dim=-1) == batch["labels"]).sum().item()
 
             else:
                 # Forward pass
-                logits = model(batch["input_ids"], batch.get("attention_mask", None))["logits"]
+                logits = model(
+                    batch["input_ids"],
+                    batch.get("attention_mask"),
+                    batch.get("document_ids"),
+                )["logits"]
                 train_loss = train_loss_fn(logits.view(-1, cfg.tokenizer.vocab_size), batch["labels"].view(-1))
 
                 # Compute gradient and apply clipping
@@ -233,10 +247,7 @@ def trainer(cfg: DictConfig):
                 pbar.update(1)
                 metrics["train/steps"] += 1
                 metrics["train/local_samples"] += batch["input_ids"].shape[0]
-                if "attention_mask" in batch.keys():
-                    metrics["train/local_tokens"] += (batch["attention_mask"] == 0).sum().item()
-                else:
-                    metrics["train/local_tokens"] += batch["input_ids"].shape[1]
+                metrics["train/local_tokens"] += count_batch_tokens(batch)
                 metrics["train/local_num_pred"] += (batch["labels"] != -100).sum().item()
                 metrics["train/local_sum_loss"] += train_loss.item() * (batch["labels"] != -100).sum().item()
                 metrics["train/local_num_correct"] += (logits.argmax(dim=-1) == batch["labels"]).sum().item()
@@ -301,6 +312,22 @@ def trainer(cfg: DictConfig):
 
         # "Remove" the skipped dataloader once exhausted
         skipped_train_dataloader = None
+
+    if metrics["train/local_num_pred"] > 0:
+        metrics["train/learning_rate"] = optimizer.param_groups[0]["lr"]
+        metrics.log(accelerator)
+
+    if (
+        cfg.trainer.model.get("save_at_end", False)
+        and metrics["train/steps"] % cfg.trainer.model.save_steps != 0
+    ):
+        accelerator.save_state()
+        if accelerator.distributed_type is DistributedType.DEEPSPEED:
+            model.save_checkpoint(model_checkpoint_dir, tag=metrics["train/steps"])
+        elif accelerator.is_main_process:
+            path = os.path.join(model_checkpoint_dir, str(metrics["train/steps"]))
+            os.makedirs(path, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(path, "state_dict.pt"))
 
     # Make sure that the wandb tracker finishes correctly and close the progress bar
     pbar.close()

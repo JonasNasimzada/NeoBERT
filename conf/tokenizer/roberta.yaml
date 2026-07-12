@@ -1,0 +1,6 @@
+pretrained_model_name_or_path: FacebookAI/roberta-base
+trust_remote_code: false
+max_length: 1024
+vocab_size: 50265
+truncation: true
+chunk_long_documents: true

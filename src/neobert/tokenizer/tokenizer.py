@@ -51,14 +51,24 @@ def get_tokenizer(
     return tokenizer
 
 
-def single_column_mapping(x, tokenizer, column_name, max_length, truncation):
-    return tokenizer(
+def single_column_mapping(
+    x,
+    tokenizer,
+    column_name,
+    max_length,
+    truncation,
+    chunk_long_documents,
+):
+    tokenized = tokenizer(
         x[column_name],
         truncation=truncation,
         max_length=max_length,
         padding=False,  # no padding saves time and memory
         return_token_type_ids=False,
+        return_overflowing_tokens=chunk_long_documents,
     )
+    tokenized.pop("overflow_to_sample_mapping", None)
+    return tokenized
 
 
 def multi_column_mapping(x, tokenizer, column_name, max_length, truncation):
@@ -99,6 +109,7 @@ def tokenize(
     max_length: int = 4096,
     remove_columns: bool = True,
     truncation: bool = True,
+    chunk_long_documents: bool = False,
     **kwargs,
 ):
     # Get the number of cpu cores available to the process
@@ -110,7 +121,14 @@ def tokenize(
     # Single column tokenization
     if isinstance(column_name, str):
         features = Features({"input_ids": Sequence(Value("int32")), "attention_mask": Sequence(Value("bool"))})
-        mapping = partial(single_column_mapping, tokenizer=tokenizer, column_name=column_name, max_length=max_length, truncation=truncation)
+        mapping = partial(
+            single_column_mapping,
+            tokenizer=tokenizer,
+            column_name=column_name,
+            max_length=max_length,
+            truncation=truncation,
+            chunk_long_documents=chunk_long_documents,
+        )
 
     # Multi column tokenization
     else:

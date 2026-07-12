@@ -1,0 +1,17 @@
+tf32: true
+mixed_precision: bf16
+resume: true
+disable_tqdm: false
+max_steps: 620
+gradient_accumulation_steps: 1
+gradient_clipping: 1
+compile: true
+compile_fullgraph: false
+accelerate:
+  save_steps: 100
+  max_ckpt: 3
+model:
+  save_steps: 100
+  max_ckpt: 7
+  save_at_end: true
+dir: logs/checkpoints

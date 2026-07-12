@@ -1,0 +1,73 @@
+hidden_size: 640
+num_hidden_layers: 28
+num_attention_heads: 10
+intermediate_size: 2148
+rope: true
+rms_norm: true
+embedding_rms_norm: true
+hidden_act: swiglu
+dropout: 0
+norm_eps: 1e-05
+embedding_init_range: 0.02
+decoder_init_range: 0.02
+tie_word_embeddings: true
+lm_head_bias: false
+attention_spaces:
+  - complex
+  - complex
+  - complex
+  - complex
+  - complex
+  - complex
+  - complex
+  - complex
+  - complex
+  - complex
+  - dual
+  - dual
+  - dual
+  - dual
+  - dual
+  - dual
+  - dual
+  - dual
+  - dual
+  - split
+  - split
+  - split
+  - split
+  - split
+  - split
+  - split
+  - split
+  - split
+attention_backends:
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+dual_tangent_chunk_size: 128

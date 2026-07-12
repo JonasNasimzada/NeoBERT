@@ -36,6 +36,8 @@ def get_scheduler(
 
     schedulers = []
     milestones = []
+    decay_start = constant_steps or warmup_steps
+    decay_duration = decay_steps - decay_start
 
     # Warmup scheduler
     schedulers.append(LinearLR(optimizer, start_factor=1e-4, end_factor=1.0, total_iters=warmup_steps))
@@ -48,9 +50,9 @@ def get_scheduler(
 
     # Decay scheduler
     schedulers.append(
-        CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=lr * final_ratio)
+        CosineAnnealingLR(optimizer, T_max=decay_duration, eta_min=lr * final_ratio)
         if decay == "cosine"
-        else LinearLR(optimizer, start_factor=1.0, end_factor=final_ratio, total_iters=decay_steps)
+        else LinearLR(optimizer, start_factor=1.0, end_factor=final_ratio, total_iters=decay_duration)
     )
 
     milestones.append(decay_steps)

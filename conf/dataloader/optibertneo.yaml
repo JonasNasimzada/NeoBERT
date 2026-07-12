@@ -1,0 +1,8 @@
+train:
+  num_workers: 8
+  batch_size: 32
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  pack_sequences: false
+  prepacked_sequences: true

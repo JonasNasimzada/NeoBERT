@@ -22,6 +22,7 @@ def get_dataloader(
     pin_memory: bool = False,
     persistent_workers: bool = True,
     pack_sequences: bool = False,
+    prepacked_sequences: bool = False,
     max_length: int = 512,
 ) -> torch.utils.data.DataLoader:
     """Wrapper for constructing a ``torch`` dataloader, with a collator function applying masked language modeling and returning an additive pad mask.
@@ -51,6 +52,7 @@ def get_dataloader(
         mask_all=mask_all,
         max_length=max_length,
         pack_sequences=pack_sequences,
+        prepacked_sequences=prepacked_sequences,
     )
 
     dataloader = DataLoader(

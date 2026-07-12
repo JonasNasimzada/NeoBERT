@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import Tensor, nn
@@ -83,6 +83,7 @@ class NeoBERTComplexAttention(nn.Module):
         attn_mask: Optional[Tensor],
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        block_mask: Any,
     ) -> Tensor:
         qkv_real, qkv_imag = self.qkv((x, torch.zeros_like(x)))
         q_real, k_real, v_real = _reshape_qkv(qkv_real, self.num_heads, self.head_dim)
@@ -92,7 +93,7 @@ class NeoBERTComplexAttention(nn.Module):
         value = v_real, v_imag
         if self.rope:
             query, key = _apply_pair_rope(query, key, freqs_cis)
-        direct_mask = None if self.backend == "flash" else attn_mask
+        direct_mask = None if self.backend in ("flash", "flex") else attn_mask
         output, _ = self._complex_attention(
             tuple(_to_attention_layout(component) for component in query),
             tuple(_to_attention_layout(component) for component in key),
@@ -101,6 +102,7 @@ class NeoBERTComplexAttention(nn.Module):
             key_padding_mask=key_padding_mask,
             scale=self.head_dim**-0.5,
             backend=self.backend,
+            block_mask=block_mask,
         )
         output = tuple(_from_attention_layout(component) for component in output)
         output_real, output_imag = self.out_proj(output)
@@ -113,6 +115,7 @@ class NeoBERTComplexAttention(nn.Module):
         attn_mask: Optional[Tensor],
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        block_mask: Any,
     ) -> Tensor:
         qkv_real, qkv_split = self.qkv((x, torch.zeros_like(x)))
         q_real, k_real, v_real = _reshape_qkv(qkv_real, self.num_heads, self.head_dim)
@@ -121,7 +124,7 @@ class NeoBERTComplexAttention(nn.Module):
             q_real, k_real = apply_rotary_emb(q_real, k_real, freqs_cis)
             q_split, k_split = apply_rotary_emb(q_split, k_split, freqs_cis)
 
-        direct_mask = None if self.backend == "flash" else attn_mask
+        direct_mask = None if self.backend in ("flash", "flex") else attn_mask
         output, _ = self._split_attention(
             (_to_attention_layout(q_real), _to_attention_layout(q_split)),
             (_to_attention_layout(k_real), _to_attention_layout(k_split)),
@@ -130,6 +133,7 @@ class NeoBERTComplexAttention(nn.Module):
             key_padding_mask=key_padding_mask,
             scale=self.head_dim**-0.5,
             backend=self.backend,
+            block_mask=block_mask,
         )
         output = (_from_attention_layout(output[0]), _from_attention_layout(output[1]))
         output_real, output_split = self.out_proj(output)
@@ -142,6 +146,7 @@ class NeoBERTComplexAttention(nn.Module):
         attn_mask: Optional[Tensor],
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        block_mask: Any,
     ) -> Tensor:
         zeros = torch.zeros_like(x)
         qkv_primal, qkv_dual = self.qkv(((x, zeros), (zeros, zeros)))
@@ -170,6 +175,7 @@ class NeoBERTComplexAttention(nn.Module):
             backend=self.backend,
             compute_dtype=x.dtype,
             tangent_chunk_size=self.dual_tangent_chunk_size,
+            block_mask=block_mask,
         )
         output = tuple(
             tuple(_from_attention_layout(component) for component in pair)
@@ -190,9 +196,10 @@ class NeoBERTComplexAttention(nn.Module):
         attn_mask: Optional[Tensor],
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        block_mask: Any = None,
     ) -> Tensor:
         if self.space == "complex":
-            return self._complex_forward(x, attn_mask, key_padding_mask, freqs_cis)
+            return self._complex_forward(x, attn_mask, key_padding_mask, freqs_cis, block_mask)
         if self.space == "split":
-            return self._split_forward(x, attn_mask, key_padding_mask, freqs_cis)
-        return self._dual_forward(x, attn_mask, key_padding_mask, freqs_cis)
+            return self._split_forward(x, attn_mask, key_padding_mask, freqs_cis, block_mask)
+        return self._dual_forward(x, attn_mask, key_padding_mask, freqs_cis, block_mask)

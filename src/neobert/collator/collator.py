@@ -46,26 +46,31 @@ class DataCollatorWithPacking(DefaultDataCollator):
             return_tensors = self.return_tensors
 
         packed_sequences = []
+        packed_document_ids = []
         current_sequence = []
+        current_document_ids = []
 
-        i = 0
-        while i < len(features) or current_sequence:
-            current_length = len(current_sequence)
-            while current_length < self.max_length and i < len(features):
-                seq = features[i]["input_ids"]
-                i += 1
-
-                current_sequence.extend(seq)
-                current_length = len(current_sequence)
-
-            # Truncate sequence and add to packed sequences
-            if current_length >= self.max_length:
+        for document_id, feature in enumerate(features):
+            sequence = feature["input_ids"]
+            current_sequence.extend(sequence)
+            current_document_ids.extend([document_id] * len(sequence))
+            while len(current_sequence) >= self.max_length:
                 packed_sequences.append({"input_ids": current_sequence[: self.max_length]})
+                packed_document_ids.append(current_document_ids[: self.max_length])
+                current_sequence = current_sequence[self.max_length :]
+                current_document_ids = current_document_ids[self.max_length :]
 
-            # Keep truncated end of sequence for the next packing
-            current_sequence = current_sequence[self.max_length :] if current_length > self.max_length + 1 else []
+        if not packed_sequences and current_sequence:
+            padding = self.max_length - len(current_sequence)
+            packed_sequences.append(
+                {"input_ids": current_sequence + [self.default_data_collator.tokenizer.pad_token_id] * padding}
+            )
+            packed_document_ids.append(current_document_ids + [-1] * padding)
 
-        return self.default_data_collator(packed_sequences, return_tensors)
+        batch = self.default_data_collator(packed_sequences, return_tensors)
+        batch.pop("attention_mask", None)
+        batch["document_ids"] = torch.tensor(packed_document_ids, dtype=torch.int32)
+        return batch
 
 
 def get_collator(
@@ -75,8 +80,11 @@ def get_collator(
     pad_to_multiple_of: int = 8,
     mask_all: bool = False,
     pack_sequences: bool = False,
+    prepacked_sequences: bool = False,
     max_length: int = 512,
 ):
+    if pack_sequences and prepacked_sequences:
+        raise ValueError("pack_sequences and prepacked_sequences are mutually exclusive")
     # No need to apply any padding if sequences are packed
     if pack_sequences:
         pad_to_multiple_of = None
@@ -105,8 +113,20 @@ def get_collator(
         )
 
         def collate_fn(batch):
-            batch = collator(batch)
-            batch["attention_mask"] = None
+            return collator(batch)
+
+    elif prepacked_sequences:
+
+        def collate_fn(batch):
+            document_ids = torch.tensor(
+                [feature["document_ids"] for feature in batch],
+                dtype=torch.int32,
+            )
+            batch = mlm_collator(
+                [{"input_ids": feature["input_ids"]} for feature in batch]
+            )
+            batch.pop("attention_mask", None)
+            batch["document_ids"] = document_ids
             return batch
 
     else:
