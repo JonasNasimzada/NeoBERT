@@ -137,9 +137,7 @@ class NeoBERTComplexAttention(nn.Module):
             block_mask=block_mask,
         )
         output = tuple(_from_attention_layout(component) for component in output)
-        output_real, output_imag = self.out_proj(output)
-        coefficients = self.readout.to(dtype=output_real.dtype)
-        return coefficients[0] * output_real + coefficients[1] * output_imag
+        return self.out_proj.forward_readout(output, self.readout)
 
     def _split_forward(
         self,
@@ -170,9 +168,7 @@ class NeoBERTComplexAttention(nn.Module):
             block_mask=block_mask,
         )
         output = (_from_attention_layout(output[0]), _from_attention_layout(output[1]))
-        output_real, output_split = self.out_proj(output)
-        coefficients = self.readout.to(dtype=output_real.dtype)
-        return coefficients[0] * output_real + coefficients[1] * output_split
+        return self.out_proj.forward_readout(output, self.readout)
 
     def _dual_forward(
         self,
@@ -216,14 +212,7 @@ class NeoBERTComplexAttention(nn.Module):
             tuple(_from_attention_layout(component) for component in pair)
             for pair in output
         )
-        output_primal, output_dual = self.out_proj(output)
-        coefficients = self.readout.to(dtype=output_primal[0].dtype)
-        return (
-            coefficients[0] * output_primal[0]
-            + coefficients[1] * output_primal[1]
-            + coefficients[2] * output_dual[0]
-            + coefficients[3] * output_dual[1]
-        )
+        return self.out_proj.forward_readout(output, self.readout)
 
     def forward(
         self,

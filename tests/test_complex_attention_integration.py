@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -215,6 +216,65 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             freqs_cis=None,
         )
         self.assertIs(captured["attn_mask"], mask)
+
+    def test_real_flash_bridge_preserves_explicit_mask(self):
+        query = torch.randn(2, 4, 2, 3)
+        mask = torch.ones(2, 1, 1, 4, dtype=torch.bool)
+        fused_output = torch.zeros(2, 2, 4, 3)
+        config = SimpleNamespace(attention_backend="flash")
+
+        with mock.patch(
+            "complex_attention.efficient_attention",
+            return_value=fused_output,
+        ) as attention:
+            output = model_module._real_attention(
+                query,
+                query,
+                query,
+                mask,
+                None,
+                config,
+            )
+
+        self.assertEqual(output.shape, query.shape)
+        self.assertIs(attention.call_args.kwargs["attn_mask"], mask)
+
+    def test_real_torch_bridge_applies_key_padding_without_bias(self):
+        query = torch.randn(2, 4, 2, 3)
+        key_padding_mask = torch.tensor(
+            [[False, False, True, True], [False, True, True, True]]
+        )
+        config = SimpleNamespace(attention_backend="torch")
+
+        actual = model_module._real_attention(
+            query,
+            query,
+            query,
+            None,
+            key_padding_mask,
+            config,
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            query.transpose(1, 2),
+            query.transpose(1, 2),
+            attn_mask=key_padding_mask.logical_not()[:, None, None, :],
+        ).transpose(1, 2)
+        torch.testing.assert_close(actual, expected)
+
+    def test_real_flex_bridge_rejects_unrepresented_mask(self):
+        query = torch.randn(2, 4, 2, 3)
+        config = SimpleNamespace(attention_backend="flex")
+
+        with self.assertRaisesRegex(ValueError, "requires block_mask"):
+            model_module._real_attention(
+                query,
+                query,
+                query,
+                torch.ones(2, 1, 1, 4, dtype=torch.bool),
+                None,
+                config,
+            )
 
     def test_complex_projection_initialization_matches_real_energy(self):
         initialization_range = 0.02

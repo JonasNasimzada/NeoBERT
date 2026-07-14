@@ -32,24 +32,26 @@ from .rmsnorm import RMSNorm
 from .rotary import precompute_freqs_cis, apply_rotary_emb
 
 
-def _is_binary_float_mask(mask):
-    return bool((mask == 1).any()) and bool(((mask == 0) | (mask == 1)).all())
-
-
 def _valid_tokens_from_padding_mask(pad_mask):
     if pad_mask.dtype == torch.bool or not torch.is_floating_point(pad_mask):
         return pad_mask.bool()
-    if _is_binary_float_mask(pad_mask):
-        return pad_mask > 0
-    additive_values = (pad_mask == 0) | torch.isneginf(pad_mask)
-    if not bool(additive_values.all()):
-        raise ValueError(
-            "floating pad_mask must be binary 0/1 or an additive padding mask containing only 0/-inf"
+    has_one, has_binary_values, has_additive_values = torch.stack(
+        (
+            (pad_mask == 1).any(),
+            ((pad_mask == 0) | (pad_mask == 1)).all(),
+            ((pad_mask == 0) | torch.isneginf(pad_mask)).all(),
         )
-    return pad_mask == 0
+    ).tolist()
+    if has_one and has_binary_values:
+        return pad_mask > 0
+    if has_additive_values:
+        return pad_mask == 0
+    raise ValueError(
+        "floating pad_mask must be binary 0/1 or an additive padding mask containing only 0/-inf"
+    )
 
 
-def _prepare_attention_masks(pad_mask, _num_heads, seq_len):
+def _prepare_attention_masks(pad_mask, num_heads, seq_len):
     if pad_mask is None:
         return None, None
     if pad_mask.dim() != 2:
@@ -104,12 +106,11 @@ def _prepare_document_masks(document_ids, include_dense_mask, padding_only=False
     return block_mask, dense_mask
 
 
-def _document_ids_from_padding_mask(pad_mask):
-    valid_tokens = _valid_tokens_from_padding_mask(pad_mask)
+def _document_ids_from_key_padding_mask(key_padding_mask):
     return torch.where(
-        valid_tokens,
-        torch.zeros_like(pad_mask, dtype=torch.int32),
-        torch.full_like(pad_mask, -1, dtype=torch.int32),
+        key_padding_mask.logical_not(),
+        torch.zeros_like(key_padding_mask, dtype=torch.int32),
+        torch.full_like(key_padding_mask, -1, dtype=torch.int32),
     )
 
 
@@ -130,16 +131,15 @@ def _real_attention(
     if backend == "xformers":
         try:
             from complex_attention import efficient_attention
-        except ImportError as error:
+        except (ImportError, OSError) as error:
             raise ImportError(
                 "Install ComplexAttention before using attention_backend='xformers'"
             ) from error
-        direct_bias = None if key_padding_mask is not None else attn_bias
         return efficient_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            attn_mask=direct_bias,
+            attn_mask=attn_bias,
             key_padding_mask=key_padding_mask,
             scale=scale,
             backend="xformers",
@@ -147,7 +147,7 @@ def _real_attention(
     if backend == "flash":
         try:
             from complex_attention import efficient_attention
-        except ImportError as error:
+        except (ImportError, OSError) as error:
             raise ImportError(
                 "Install ComplexAttention before using attention_backend='flash'"
             ) from error
@@ -155,14 +155,17 @@ def _real_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
+            attn_mask=attn_bias,
             key_padding_mask=key_padding_mask,
             scale=scale,
             backend="flash",
         ).transpose(1, 2)
     if backend == "flex":
+        if attn_bias is not None or key_padding_mask is not None:
+            raise ValueError("real FlexAttention requires masking to be represented only by block_mask")
         try:
             from complex_attention import efficient_attention
-        except ImportError as error:
+        except (ImportError, OSError) as error:
             raise ImportError(
                 "Install ComplexAttention before using attention_backend='flex'"
             ) from error
@@ -177,7 +180,17 @@ def _real_attention(
     if backend != "torch":
         raise ValueError(f"unsupported real attention backend: {backend}")
 
-    bias = None if attn_bias is None else attn_bias.to(dtype=query.dtype, device=query.device)
+    bias = None if attn_bias is None else attn_bias.to(device=query.device)
+    if bias is not None and bias.dtype != torch.bool:
+        bias = bias.to(dtype=query.dtype)
+    if key_padding_mask is not None:
+        padding_keep = key_padding_mask.logical_not()[:, None, None, :]
+        if bias is None:
+            bias = padding_keep
+        elif bias.dtype == torch.bool:
+            bias = bias & padding_keep
+        else:
+            bias = bias.masked_fill(padding_keep.logical_not(), float("-inf"))
     return scaled_dot_product_attention(
         query=query.transpose(1, 2),
         key=key.transpose(1, 2),
@@ -388,12 +401,15 @@ class EncoderBlock(nn.Module):
         if self.config.rope:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
+        uses_block_mask = self.attention_backend == "flex" and layer_block_mask is not None
+        attention_bias = None if key_padding_mask is not None or uses_block_mask else pad_mask
+        direct_key_padding = None if uses_block_mask else key_padding_mask
         attn = _real_attention(
             xq,
             xk,
             xv,
-            pad_mask,
-            key_padding_mask,
+            attention_bias,
+            direct_key_padding,
             self.config,
             backend=self.attention_backend,
             block_mask=layer_block_mask,
@@ -501,12 +517,15 @@ class NormEncoderBlock(nn.Module):
 
         softmax_scale = (self.config.hidden_size / self.config.num_attention_heads) ** 0.5
 
+        uses_block_mask = self.attention_backend == "flex" and layer_block_mask is not None
+        attention_bias = None if key_padding_mask is not None or uses_block_mask else pad_mask
+        direct_key_padding = None if uses_block_mask else key_padding_mask
         attn = _real_attention(
             xq,
             xk,
             xv,
-            pad_mask,
-            key_padding_mask,
+            attention_bias,
+            direct_key_padding,
             self.config,
             scale=softmax_scale,
             backend=self.attention_backend,
@@ -580,11 +599,6 @@ class NeoBERT(NeoBERTPreTrainedModel):
         uses_only_flex = all(
             backend == "flex" for backend in self.config.attention_backends
         )
-        flex_document_ids = document_ids
-        if document_ids is None and pad_mask is not None and uses_flex:
-            flex_document_ids = _document_ids_from_padding_mask(pad_mask)
-            if uses_only_flex:
-                pad_mask = None
         if document_ids is not None:
             if document_ids.shape != src.shape:
                 raise ValueError("document_ids must have the same shape as input_ids")
@@ -597,6 +611,12 @@ class NeoBERT(NeoBERTPreTrainedModel):
             self.config.num_attention_heads,
             src.shape[1],
         )
+        flex_document_ids = document_ids
+        if document_ids is None and key_padding_mask is not None and uses_flex:
+            flex_document_ids = _document_ids_from_key_padding_mask(key_padding_mask)
+            if uses_only_flex:
+                pad_mask = None
+                key_padding_mask = None
         needs_dual_flex_mask = any(
             space == "dual" and backend == "flex"
             for space, backend in zip(
@@ -687,16 +707,17 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
         uses_only_flex = all(
             backend == "flex" for backend in self.config.attention_backends
         )
-        flex_document_ids = None
-        if pad_mask is not None and uses_flex:
-            flex_document_ids = _document_ids_from_padding_mask(pad_mask)
-            if uses_only_flex:
-                pad_mask = None
         pad_mask, key_padding_mask = _prepare_attention_masks(
             pad_mask,
             self.config.num_attention_heads,
             src.shape[1],
         )
+        flex_document_ids = None
+        if key_padding_mask is not None and uses_flex:
+            flex_document_ids = _document_ids_from_key_padding_mask(key_padding_mask)
+            if uses_only_flex:
+                pad_mask = None
+                key_padding_mask = None
         block_mask, _ = _prepare_document_masks(
             flex_document_ids,
             include_dense_mask=False,
