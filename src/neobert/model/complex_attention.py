@@ -1,3 +1,4 @@
+import math
 from typing import Any, Optional
 
 import torch
@@ -77,6 +78,35 @@ class NeoBERTComplexAttention(nn.Module):
             raise ValueError(f"unsupported complex attention space: {self.space}")
         self.readout = nn.Parameter(readout)
 
+    def reset_parameters(self, initialization_range: float) -> None:
+        if self.space == "complex":
+            bound = initialization_range / math.sqrt(2.0)
+            layers = (self.qkv, self.out_proj)
+            with torch.no_grad():
+                for layer in layers:
+                    layer.weight_real.uniform_(-bound, bound)
+                    layer.weight_imag.uniform_(-bound, bound)
+        elif self.space == "split":
+            bound = initialization_range / math.sqrt(2.0)
+            layers = (self.qkv, self.out_proj)
+            with torch.no_grad():
+                for layer in layers:
+                    layer.weight_real.uniform_(-bound, bound)
+                    layer.weight_split.uniform_(-bound, bound)
+        else:
+            bound = initialization_range / 2.0
+            layers = (self.qkv, self.out_proj)
+            with torch.no_grad():
+                for layer in layers:
+                    for component in (layer.primal, layer.dual):
+                        component.weight_real.uniform_(-bound, bound)
+                        component.weight_imag.uniform_(-bound, bound)
+        with torch.no_grad():
+            self.readout.zero_()
+            self.readout[0].fill_(1.0)
+            if self.space == "dual":
+                self.readout[2].fill_(1.0)
+
     def _complex_forward(
         self,
         x: Tensor,
@@ -85,7 +115,7 @@ class NeoBERTComplexAttention(nn.Module):
         freqs_cis: Optional[Tensor],
         block_mask: Any,
     ) -> Tensor:
-        qkv_real, qkv_imag = self.qkv((x, torch.zeros_like(x)))
+        qkv_real, qkv_imag = self.qkv.forward_real(x)
         q_real, k_real, v_real = _reshape_qkv(qkv_real, self.num_heads, self.head_dim)
         q_imag, k_imag, v_imag = _reshape_qkv(qkv_imag, self.num_heads, self.head_dim)
         query = q_real, q_imag
@@ -93,13 +123,15 @@ class NeoBERTComplexAttention(nn.Module):
         value = v_real, v_imag
         if self.rope:
             query, key = _apply_pair_rope(query, key, freqs_cis)
-        direct_mask = None if self.backend in ("flash", "flex") else attn_mask
+        uses_block_mask = self.backend == "flex" and block_mask is not None
+        direct_mask = None if uses_block_mask else attn_mask
+        direct_key_padding = None if uses_block_mask else key_padding_mask
         output, _ = self._complex_attention(
             tuple(_to_attention_layout(component) for component in query),
             tuple(_to_attention_layout(component) for component in key),
             tuple(_to_attention_layout(component) for component in value),
             attn_mask=direct_mask,
-            key_padding_mask=key_padding_mask,
+            key_padding_mask=direct_key_padding,
             scale=self.head_dim**-0.5,
             backend=self.backend,
             block_mask=block_mask,
@@ -117,20 +149,22 @@ class NeoBERTComplexAttention(nn.Module):
         freqs_cis: Optional[Tensor],
         block_mask: Any,
     ) -> Tensor:
-        qkv_real, qkv_split = self.qkv((x, torch.zeros_like(x)))
+        qkv_real, qkv_split = self.qkv.forward_real(x)
         q_real, k_real, v_real = _reshape_qkv(qkv_real, self.num_heads, self.head_dim)
         q_split, k_split, v_split = _reshape_qkv(qkv_split, self.num_heads, self.head_dim)
         if self.rope:
             q_real, k_real = apply_rotary_emb(q_real, k_real, freqs_cis)
             q_split, k_split = apply_rotary_emb(q_split, k_split, freqs_cis)
 
-        direct_mask = None if self.backend in ("flash", "flex") else attn_mask
+        uses_block_mask = self.backend == "flex" and block_mask is not None
+        direct_mask = None if uses_block_mask else attn_mask
+        direct_key_padding = None if uses_block_mask else key_padding_mask
         output, _ = self._split_attention(
             (_to_attention_layout(q_real), _to_attention_layout(q_split)),
             (_to_attention_layout(k_real), _to_attention_layout(k_split)),
             (_to_attention_layout(v_real), _to_attention_layout(v_split)),
             attn_mask=direct_mask,
-            key_padding_mask=key_padding_mask,
+            key_padding_mask=direct_key_padding,
             scale=self.head_dim**-0.5,
             backend=self.backend,
             block_mask=block_mask,
@@ -148,8 +182,7 @@ class NeoBERTComplexAttention(nn.Module):
         freqs_cis: Optional[Tensor],
         block_mask: Any,
     ) -> Tensor:
-        zeros = torch.zeros_like(x)
-        qkv_primal, qkv_dual = self.qkv(((x, zeros), (zeros, zeros)))
+        qkv_primal, qkv_dual = self.qkv.forward_real(x)
         primal_parts = tuple(_reshape_qkv(component, self.num_heads, self.head_dim) for component in qkv_primal)
         dual_parts = tuple(_reshape_qkv(component, self.num_heads, self.head_dim) for component in qkv_dual)
         query = ((primal_parts[0][0], primal_parts[1][0]), (dual_parts[0][0], dual_parts[1][0]))
@@ -164,13 +197,15 @@ class NeoBERTComplexAttention(nn.Module):
         query = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in query)
         key = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in key)
         value = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in value)
-        direct_mask = None if self.backend == "flash" else attn_mask
+        uses_block_mask = self.backend == "flex" and block_mask is not None
+        direct_mask = attn_mask
+        direct_key_padding = None if uses_block_mask else key_padding_mask
         output, _ = self._dual_attention(
             query,
             key,
             value,
             attn_mask=direct_mask,
-            key_padding_mask=key_padding_mask,
+            key_padding_mask=direct_key_padding,
             scale=self.head_dim**-0.5,
             backend=self.backend,
             compute_dtype=x.dtype,
