@@ -21,7 +21,7 @@ The paper's 198M count is `12 * 768^2 * 28 = 198,180,864` and omits embeddings a
 - global batch 2,048 sequences = 2,097,152 tokens
 - 620 optimizer steps = 1,300,234,240 scheduled tokens
 
-The baseline follows the paper architecture and training settings. The paper states that OptiBERTneo retains NeoBERT's batch size and learning rate; those values are taken from the NeoBERT training appendix. PyTorch FlexAttention implements the paper's document-restricted packed attention for both variants.
+The baseline follows the paper architecture and training settings. The paper states that OptiBERTneo retains NeoBERT's batch size and learning rate; those values are taken from the NeoBERT training appendix. PyTorch FlexAttention implements document-restricted packed attention for the baseline and for the mixed model's ordinary- and dual-complex layers. Split-complex layers use the exact torch path with one shared dense boolean document mask, because a narrow FlexAttention output would round each idempotent branch before exact reconstruction.
 
 The authors did not publish an OptiBERT training repository or exact data order with the paper. This setup is therefore a controlled public reconstruction of the reported recipe, not a bitwise reproduction of their checkpoint.
 
@@ -71,8 +71,8 @@ srun --nodes="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 \
   bash jobs/optibertneo-1p3b.sh baseline
 ```
 
-Useful environment overrides are `GPUS_PER_NODE`, `MICRO_BATCH`, `OPTIBERT_DATASET`, `RUN_ROOT`, `WANDB_MODE`, `MASTER_ADDR`, and `MASTER_PORT`. Defaults on 8 GPUs are microbatch 32 and accumulation 8 for the baseline, and microbatch 4 and accumulation 64 for the mixed model. Reduce `MICRO_BATCH` if the dual blocks exceed memory; the launcher increases accumulation automatically to preserve the global batch.
+Useful environment overrides are `GPUS_PER_NODE`, `MICRO_BATCH`, `OPTIBERT_DATASET`, `RUN_ROOT`, `WANDB_MODE`, `MASTER_ADDR`, and `MASTER_PORT`. Defaults on 8 GPUs are microbatch 32 and accumulation 8 for the baseline, and microbatch 4 and accumulation 64 for the mixed model. Reduce `MICRO_BATCH` if the dual blocks or exact split layers exceed memory; the launcher increases accumulation automatically to preserve the global batch.
 
 ## Compare results
 
-Report MLM loss against tokens, wall-clock time, tokens/second, peak GPU memory, and downstream GLUE/MTEB results. Parameter matching does not make compute identical: split attention invokes two efficient attention kernels, while dual attention also computes the exact tangent/JVP. Include both equal-token quality and measured training cost in the final comparison.
+Report MLM loss against tokens, wall-clock time, tokens/second, peak GPU memory, and downstream GLUE/MTEB results. Parameter matching does not make compute identical: split attention evaluates two idempotent softmax channels with widened stable reductions, while dual attention computes the exact tiled tangent/JVP. Include both equal-token quality and measured training cost in the final comparison.

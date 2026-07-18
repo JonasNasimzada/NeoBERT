@@ -114,6 +114,7 @@ class NeoBERTComplexAttention(nn.Module):
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         block_mask: Any,
+        prepared_key_padding_mask: Any,
     ) -> Tensor:
         qkv_real, qkv_imag = self.qkv.forward_real(x)
         q_real, k_real, v_real = _reshape_qkv(qkv_real, self.num_heads, self.head_dim)
@@ -126,6 +127,7 @@ class NeoBERTComplexAttention(nn.Module):
         uses_block_mask = self.backend == "flex" and block_mask is not None
         direct_mask = None if uses_block_mask else attn_mask
         direct_key_padding = None if uses_block_mask else key_padding_mask
+        direct_prepared_padding = None if uses_block_mask else prepared_key_padding_mask
         output, _ = self._complex_attention(
             tuple(_to_attention_layout(component) for component in query),
             tuple(_to_attention_layout(component) for component in key),
@@ -135,6 +137,7 @@ class NeoBERTComplexAttention(nn.Module):
             scale=self.head_dim**-0.5,
             backend=self.backend,
             block_mask=block_mask,
+            prepared_key_padding_mask=direct_prepared_padding,
         )
         output = tuple(_from_attention_layout(component) for component in output)
         return self.out_proj.forward_readout(output, self.readout)
@@ -146,6 +149,7 @@ class NeoBERTComplexAttention(nn.Module):
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         block_mask: Any,
+        prepared_key_padding_mask: Any,
     ) -> Tensor:
         qkv_real, qkv_split = self.qkv.forward_real(x)
         q_real, k_real, v_real = _reshape_qkv(qkv_real, self.num_heads, self.head_dim)
@@ -157,6 +161,7 @@ class NeoBERTComplexAttention(nn.Module):
         uses_block_mask = self.backend == "flex" and block_mask is not None
         direct_mask = None if uses_block_mask else attn_mask
         direct_key_padding = None if uses_block_mask else key_padding_mask
+        direct_prepared_padding = None if uses_block_mask else prepared_key_padding_mask
         output, _ = self._split_attention(
             (_to_attention_layout(q_real), _to_attention_layout(q_split)),
             (_to_attention_layout(k_real), _to_attention_layout(k_split)),
@@ -166,6 +171,7 @@ class NeoBERTComplexAttention(nn.Module):
             scale=self.head_dim**-0.5,
             backend=self.backend,
             block_mask=block_mask,
+            prepared_key_padding_mask=direct_prepared_padding,
         )
         output = (_from_attention_layout(output[0]), _from_attention_layout(output[1]))
         return self.out_proj.forward_readout(output, self.readout)
@@ -177,6 +183,7 @@ class NeoBERTComplexAttention(nn.Module):
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         block_mask: Any,
+        tangent_mask_mod: Any,
     ) -> Tensor:
         qkv_primal, qkv_dual = self.qkv.forward_real(x)
         primal_parts = tuple(_reshape_qkv(component, self.num_heads, self.head_dim) for component in qkv_primal)
@@ -194,7 +201,7 @@ class NeoBERTComplexAttention(nn.Module):
         key = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in key)
         value = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in value)
         uses_block_mask = self.backend == "flex" and block_mask is not None
-        direct_mask = attn_mask
+        direct_mask = None if uses_block_mask else attn_mask
         direct_key_padding = None if uses_block_mask else key_padding_mask
         output, _ = self._dual_attention(
             query,
@@ -204,9 +211,9 @@ class NeoBERTComplexAttention(nn.Module):
             key_padding_mask=direct_key_padding,
             scale=self.head_dim**-0.5,
             backend=self.backend,
-            compute_dtype=x.dtype,
             tangent_chunk_size=self.dual_tangent_chunk_size,
             block_mask=block_mask,
+            tangent_mask_mod=tangent_mask_mod,
         )
         output = tuple(
             tuple(_from_attention_layout(component) for component in pair)
@@ -221,9 +228,44 @@ class NeoBERTComplexAttention(nn.Module):
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         block_mask: Any = None,
+        tangent_mask_mod: Any = None,
+        prepared_key_padding_mask: Any = None,
     ) -> Tensor:
+        if self.space != "dual" and tangent_mask_mod is not None:
+            raise ValueError("tangent_mask_mod is only valid for dual-complex attention")
+        if key_padding_mask is None and prepared_key_padding_mask is not None:
+            key_padding_mask = getattr(
+                prepared_key_padding_mask,
+                "key_padding_mask",
+                None,
+            )
+            if key_padding_mask is None:
+                raise ValueError(
+                    "prepared_key_padding_mask must come from prepare_key_padding_mask"
+                )
         if self.space == "complex":
-            return self._complex_forward(x, attn_mask, key_padding_mask, freqs_cis, block_mask)
+            return self._complex_forward(
+                x,
+                attn_mask,
+                key_padding_mask,
+                freqs_cis,
+                block_mask,
+                prepared_key_padding_mask,
+            )
         if self.space == "split":
-            return self._split_forward(x, attn_mask, key_padding_mask, freqs_cis, block_mask)
-        return self._dual_forward(x, attn_mask, key_padding_mask, freqs_cis, block_mask)
+            return self._split_forward(
+                x,
+                attn_mask,
+                key_padding_mask,
+                freqs_cis,
+                block_mask,
+                prepared_key_padding_mask,
+            )
+        return self._dual_forward(
+            x,
+            attn_mask,
+            key_padding_mask,
+            freqs_cis,
+            block_mask,
+            tangent_mask_mod,
+        )

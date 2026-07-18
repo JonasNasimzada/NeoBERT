@@ -10,8 +10,6 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from torch.nn.functional import scaled_dot_product_attention
-
 from typing import Any, Dict, List, Optional
 from functools import partial
 
@@ -33,27 +31,42 @@ from .rotary import precompute_freqs_cis, apply_rotary_emb
 
 
 def _valid_tokens_from_padding_mask(pad_mask):
-    if pad_mask.dtype == torch.bool or not torch.is_floating_point(pad_mask):
-        return pad_mask.bool()
-    has_one, has_binary_values, has_additive_values = torch.stack(
-        (
-            (pad_mask == 1).any(),
-            ((pad_mask == 0) | (pad_mask == 1)).all(),
-            ((pad_mask == 0) | torch.isneginf(pad_mask)).all(),
-        )
-    ).tolist()
-    if has_one and has_binary_values:
-        return pad_mask > 0
-    if has_additive_values:
-        return pad_mask == 0
-    raise ValueError(
-        "floating pad_mask must be binary 0/1 or an additive padding mask containing only 0/-inf"
+    if not isinstance(pad_mask, torch.Tensor):
+        raise ValueError("pad_mask must be a tensor")
+    if pad_mask.dtype == torch.bool:
+        return pad_mask
+    integer_dtypes = (
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
     )
+    if pad_mask.dtype in integer_dtypes:
+        if not bool(((pad_mask == 0) | (pad_mask == 1)).all()):
+            raise ValueError("integer pad_mask must be binary 0/1")
+        return pad_mask > 0
+    if not torch.is_floating_point(pad_mask):
+        raise ValueError("pad_mask must have bool, integer, or real floating-point dtype")
+    # A floating mask containing -inf is unambiguously additive. Otherwise it
+    # follows the standard 0/1 attention-mask convention, including an all-zero
+    # (fully padded) batch. A no-op additive mask should be passed as None.
+    if bool(torch.isneginf(pad_mask).any()):
+        if not bool(((pad_mask == 0) | torch.isneginf(pad_mask)).all()):
+            raise ValueError(
+                "additive floating pad_mask may contain only 0/-inf"
+            )
+        return pad_mask == 0
+    if not bool(((pad_mask == 0) | (pad_mask == 1)).all()):
+        raise ValueError("floating pad_mask must be binary 0/1")
+    return pad_mask > 0
 
 
 def _prepare_attention_masks(pad_mask, num_heads, seq_len):
     if pad_mask is None:
         return None, None
+    if not isinstance(pad_mask, torch.Tensor):
+        raise ValueError("pad_mask must be a tensor")
     if pad_mask.dim() != 2:
         raise ValueError("pad_mask must have shape (batch, sequence)")
     if pad_mask.size(1) != seq_len:
@@ -72,11 +85,19 @@ def _prepare_attention_masks(pad_mask, num_heads, seq_len):
     return attention_bias, key_padding_mask
 
 
-def _prepare_document_masks(document_ids, include_dense_mask, padding_only=False):
+def _prepare_document_masks(document_ids, include_tangent_mask_mod, padding_only=False):
     if document_ids is None:
         return None, None
     if document_ids.dim() != 2:
         raise ValueError("document_ids must have shape (batch, sequence)")
+    if document_ids.dtype not in (
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("document_ids must use an integer dtype")
 
     from torch.nn.attention.flex_attention import create_block_mask
 
@@ -96,14 +117,32 @@ def _prepare_document_masks(document_ids, include_dense_mask, padding_only=False
         KV_LEN=sequence_length,
         device=document_ids.device,
     )
-    dense_mask = None
-    if include_dense_mask:
-        if padding_only:
-            dense_mask = document_ids[:, None, None, :] >= 0
-        else:
-            dense_mask = document_ids[:, None, :, None] == document_ids[:, None, None, :]
-            dense_mask = dense_mask & (document_ids[:, None, :, None] >= 0)
-    return block_mask, dense_mask
+    # Return the exact same callable stored by BlockMask.  Dual attention uses
+    # it to construct each tangent tile lazily, which guarantees primal and
+    # tangent masking are identical without allocating a dense B x L x L mask.
+    tangent_mask_mod = document_mask if include_tangent_mask_mod else None
+    return block_mask, tangent_mask_mod
+
+
+def _prepare_dense_document_mask(document_ids, padding_only=False):
+    """Build one shared real keep-mask for exact non-Flex packed layers."""
+    if document_ids is None:
+        return None
+    if document_ids.dim() != 2:
+        raise ValueError("document_ids must have shape (batch, sequence)")
+    if document_ids.dtype not in (
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("document_ids must use an integer dtype")
+    if padding_only:
+        return document_ids[:, None, None, :] >= 0
+    query_document = document_ids[:, None, :, None]
+    key_document = document_ids[:, None, None, :]
+    return (query_document == key_document) & (query_document >= 0)
 
 
 def _document_ids_from_key_padding_mask(key_padding_mask):
@@ -112,6 +151,24 @@ def _document_ids_from_key_padding_mask(key_padding_mask):
         torch.zeros_like(key_padding_mask, dtype=torch.int32),
         torch.full_like(key_padding_mask, -1, dtype=torch.int32),
     )
+
+
+def _prepare_backend_padding_metadata(key_padding_mask, attention_spaces, attention_backends):
+    if key_padding_mask is None:
+        return None
+    needs_metadata = any(
+        backend in ("flash", "xformers") and space in ("real", "complex")
+        for space, backend in zip(attention_spaces, attention_backends)
+    )
+    if not needs_metadata:
+        return None
+    try:
+        from complex_attention import prepare_key_padding_mask
+    except (ImportError, OSError) as error:
+        raise ImportError(
+            "Install ComplexAttention before using FlashAttention/xFormers padding metadata"
+        ) from error
+    return prepare_key_padding_mask(key_padding_mask)
 
 
 def _real_attention(
@@ -124,80 +181,34 @@ def _real_attention(
     scale=None,
     backend=None,
     block_mask=None,
+    prepared_key_padding_mask=None,
 ):
     backend = config.attention_backend if backend is None else backend
     if backend == "auto":
         backend = "torch"
-    if backend == "xformers":
-        try:
-            from complex_attention import efficient_attention
-        except (ImportError, OSError) as error:
-            raise ImportError(
-                "Install ComplexAttention before using attention_backend='xformers'"
-            ) from error
-        return efficient_attention(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            attn_mask=attn_bias,
-            key_padding_mask=key_padding_mask,
-            scale=scale,
-            backend="xformers",
-        ).transpose(1, 2)
-    if backend == "flash":
-        try:
-            from complex_attention import efficient_attention
-        except (ImportError, OSError) as error:
-            raise ImportError(
-                "Install ComplexAttention before using attention_backend='flash'"
-            ) from error
-        return efficient_attention(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            attn_mask=attn_bias,
-            key_padding_mask=key_padding_mask,
-            scale=scale,
-            backend="flash",
-        ).transpose(1, 2)
+    if backend not in ("torch", "xformers", "flash", "flex"):
+        raise ValueError(f"unsupported real attention backend: {backend}")
     if backend == "flex":
         if attn_bias is not None or key_padding_mask is not None:
-            raise ValueError("real FlexAttention requires masking to be represented only by block_mask")
-        try:
-            from complex_attention import efficient_attention
-        except (ImportError, OSError) as error:
-            raise ImportError(
-                "Install ComplexAttention before using attention_backend='flex'"
-            ) from error
-        return efficient_attention(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            scale=scale,
-            backend="flex",
-            block_mask=block_mask,
-        ).transpose(1, 2)
-    if backend != "torch":
-        raise ValueError(f"unsupported real attention backend: {backend}")
-
-    bias = None if attn_bias is None else attn_bias.to(device=query.device)
-    if bias is not None and bias.dtype != torch.bool:
-        bias = bias.to(dtype=query.dtype)
-    if key_padding_mask is not None:
-        padding_keep = key_padding_mask.logical_not()[:, None, None, :]
-        if bias is None:
-            bias = padding_keep
-        elif bias.dtype == torch.bool:
-            bias = bias & padding_keep
-        else:
-            bias = bias.masked_fill(padding_keep.logical_not(), float("-inf"))
-    return scaled_dot_product_attention(
-        query=query.transpose(1, 2),
-        key=key.transpose(1, 2),
-        value=value.transpose(1, 2),
-        attn_mask=bias,
-        dropout_p=0.0,
+            raise ValueError("real FlexAttention requires block_mask to represent all masking")
+    try:
+        from complex_attention import efficient_attention
+    except (ImportError, OSError) as error:
+        raise ImportError(
+            f"Install ComplexAttention before using attention_backend='{backend}'"
+        ) from error
+    return efficient_attention(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        attn_mask=attn_bias,
+        key_padding_mask=key_padding_mask,
         scale=scale,
+        backend=backend,
+        block_mask=block_mask if backend == "flex" else None,
+        prepared_key_padding_mask=(
+            None if backend == "flex" else prepared_key_padding_mask
+        ),
     ).transpose(1, 2)
 
 
@@ -221,7 +232,7 @@ class NeoBERTConfig(PretrainedConfig):
         vocab_size: int = 32064,
         pad_token_id: int = 0,
         max_length: int = 1024,
-        flash_attention: bool = True,
+        flash_attention: Optional[bool] = None,
         attention_space: str = "real",
         attention_backend: str = "auto",
         attention_spaces: Optional[List[str]] = None,
@@ -236,12 +247,18 @@ class NeoBERTConfig(PretrainedConfig):
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
+        if hidden_size <= 0:
+            raise ValueError("Hidden size must be positive.")
+        if num_attention_heads <= 0:
+            raise ValueError("The number of attention heads must be positive.")
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         if hidden_size % num_attention_heads != 0:
             raise ValueError("Hidden size must be divisible by the number of heads.")
         self.dim_head = hidden_size // num_attention_heads
+        if rope and self.dim_head % 2 != 0:
+            raise ValueError("RoPE requires an even attention head dimension.")
         self.intermediate_size = intermediate_size
         self.dropout = dropout
         self.embedding_init_range = embedding_init_range
@@ -253,6 +270,8 @@ class NeoBERTConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
         self.max_length = max_length
+        if flash_attention is not None and not isinstance(flash_attention, bool):
+            raise ValueError("flash_attention must be a bool or None")
         self.flash_attention = flash_attention
         valid_spaces = ("real", "complex", "split", "dual")
         valid_backends = ("auto", "native", "reference", "torch", "xformers", "flash", "flex")
@@ -264,6 +283,14 @@ class NeoBERTConfig(PretrainedConfig):
             )
         if dual_tangent_chunk_size <= 0:
             raise ValueError("dual_tangent_chunk_size must be positive")
+        if (
+            attention_backends is None
+            and attention_backend == "auto"
+            and flash_attention is not None
+        ):
+            # Backward compatibility: the historical flag selected xFormers'
+            # memory-efficient attention, not the separate FlashAttention API.
+            attention_backend = "xformers" if flash_attention else "torch"
         if attention_spaces is None:
             attention_spaces = [attention_space] * num_hidden_layers
         if attention_backends is None:
@@ -281,8 +308,16 @@ class NeoBERTConfig(PretrainedConfig):
                 raise ValueError("real layers support auto, torch, xformers, flash, or flex")
             if layer_space == "complex" and layer_backend in ("native", "reference"):
                 raise ValueError("ordinary complex layers support auto, torch, xformers, flash, or flex")
-            if layer_space == "split" and layer_backend == "reference":
-                raise ValueError("split-complex layers do not use attention_backend='reference'")
+            if layer_space == "split" and layer_backend in (
+                "reference",
+                "xformers",
+                "flash",
+                "flex",
+            ):
+                raise ValueError(
+                    "split-complex layers support only auto, native, or torch; "
+                    "narrow fused backends cannot preserve exact idempotent reconstruction"
+                )
         self.attention_space = attention_space
         self.attention_backend = attention_backend
         self.attention_spaces = list(attention_spaces)
@@ -356,7 +391,8 @@ class EncoderBlock(nn.Module):
         freqs_cis: torch.Tensor,
         key_padding_mask: torch.Tensor = None,
         block_mask=None,
-        dual_attention_mask: torch.Tensor = None,
+        dual_tangent_mask_mod=None,
+        prepared_key_padding_mask=None,
     ):
         x = x + self._att_block(
             self.attention_norm(x),
@@ -364,7 +400,8 @@ class EncoderBlock(nn.Module):
             freqs_cis,
             key_padding_mask,
             block_mask,
-            dual_attention_mask,
+            dual_tangent_mask_mod,
+            prepared_key_padding_mask,
         )
         x = x + self._ff_block(self.ffn_norm(x))
         return x
@@ -376,14 +413,17 @@ class EncoderBlock(nn.Module):
         freqs_cis: torch.Tensor,
         key_padding_mask: torch.Tensor = None,
         block_mask=None,
-        dual_attention_mask: torch.Tensor = None,
+        dual_tangent_mask_mod=None,
+        prepared_key_padding_mask=None,
     ):
         layer_block_mask = block_mask if self.attention_backend == "flex" else None
         if self.complex_attention is not None:
-            if self.attention_space == "dual" and self.attention_backend == "flex":
-                attention_mask = dual_attention_mask
-            else:
-                attention_mask = None if key_padding_mask is not None else pad_mask
+            attention_mask = None if key_padding_mask is not None else pad_mask
+            tangent_mask_mod = None
+            if self.attention_backend == "flex":
+                attention_mask = None
+                if self.attention_space == "dual":
+                    tangent_mask_mod = dual_tangent_mask_mod
             return self.resid_dropout(
                 self.complex_attention(
                     x,
@@ -391,6 +431,8 @@ class EncoderBlock(nn.Module):
                     key_padding_mask,
                     freqs_cis,
                     layer_block_mask,
+                    tangent_mask_mod,
+                    prepared_key_padding_mask,
                 )
             )
 
@@ -404,6 +446,7 @@ class EncoderBlock(nn.Module):
         uses_block_mask = self.attention_backend == "flex" and layer_block_mask is not None
         attention_bias = None if key_padding_mask is not None or uses_block_mask else pad_mask
         direct_key_padding = None if uses_block_mask else key_padding_mask
+        direct_prepared_padding = None if uses_block_mask else prepared_key_padding_mask
         attn = _real_attention(
             xq,
             xk,
@@ -413,6 +456,7 @@ class EncoderBlock(nn.Module):
             self.config,
             backend=self.attention_backend,
             block_mask=layer_block_mask,
+            prepared_key_padding_mask=direct_prepared_padding,
         )
 
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head)))
@@ -472,8 +516,16 @@ class NormEncoderBlock(nn.Module):
         freqs_cis: torch.Tensor,
         key_padding_mask: torch.Tensor = None,
         block_mask=None,
+        prepared_key_padding_mask=None,
     ):
-        x_attn = self._att_block(x, pad_mask, freqs_cis, key_padding_mask, block_mask)
+        x_attn = self._att_block(
+            x,
+            pad_mask,
+            freqs_cis,
+            key_padding_mask,
+            block_mask,
+            prepared_key_padding_mask,
+        )
 
         lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
         lr = torch.abs(lr)
@@ -500,6 +552,7 @@ class NormEncoderBlock(nn.Module):
         freqs_cis: torch.Tensor,
         key_padding_mask: torch.Tensor = None,
         block_mask=None,
+        prepared_key_padding_mask=None,
     ):
         batch_size, seq_len, _ = x.shape
         layer_block_mask = block_mask if self.attention_backend == "flex" else None
@@ -520,6 +573,7 @@ class NormEncoderBlock(nn.Module):
         uses_block_mask = self.attention_backend == "flex" and layer_block_mask is not None
         attention_bias = None if key_padding_mask is not None or uses_block_mask else pad_mask
         direct_key_padding = None if uses_block_mask else key_padding_mask
+        direct_prepared_padding = None if uses_block_mask else prepared_key_padding_mask
         attn = _real_attention(
             xq,
             xk,
@@ -530,6 +584,7 @@ class NormEncoderBlock(nn.Module):
             scale=softmax_scale,
             backend=self.attention_backend,
             block_mask=layer_block_mask,
+            prepared_key_padding_mask=direct_prepared_padding,
         )
 
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.hidden_size)))
@@ -549,6 +604,70 @@ class NormEncoderBlock(nn.Module):
 class NeoBERTPreTrainedModel(PreTrainedModel):
     config_class = NeoBERTConfig
     _supports_cache_class = True
+
+    def _apply(self, fn, recurse=True):
+        # Module.to(dtype=...) converts complex buffers to a *real* dtype and
+        # discards their imaginary sine component. Keep RoPE frequencies in
+        # complex128, applying only the requested device transition; a single
+        # per-forward cast supplies complex64 to ordinary precision models.
+        freqs_cis = self._buffers.pop("freqs_cis", None)
+        try:
+            result = super()._apply(fn, recurse=recurse)
+        finally:
+            if freqs_cis is not None:
+                if freqs_cis.device.type == "meta":
+                    destination = next(
+                        (
+                            parameter.device
+                            for parameter in self.parameters()
+                            if parameter.device.type != "meta"
+                        ),
+                        freqs_cis.device,
+                    )
+                    if destination.type == "meta":
+                        restored_frequencies = freqs_cis
+                    else:
+                        restored_frequencies = precompute_freqs_cis(
+                            self.config.dim_head,
+                            self.config.max_length,
+                            dtype=torch.float64,
+                            device=destination,
+                        )
+                else:
+                    probe = fn(
+                        torch.empty(
+                            0,
+                            dtype=torch.float32,
+                            device=freqs_cis.device,
+                        )
+                    )
+                    if probe.device.type == "meta":
+                    # Keep the materialized master outside meta so a later
+                    # to_empty() can restore real frequencies instead of trying
+                    # to copy data out of a metadata-only tensor.
+                        restored_frequencies = freqs_cis
+                    else:
+                        restored_frequencies = freqs_cis.to(device=probe.device)
+                self._buffers["freqs_cis"] = restored_frequencies
+        return result
+
+    def _rope_frequencies(self, sequence_length, activation):
+        frequencies = self.freqs_cis
+        if frequencies.device.type == "meta":
+            frequencies = precompute_freqs_cis(
+                self.config.dim_head,
+                self.config.max_length,
+                dtype=torch.float64,
+                device=activation.device,
+            )
+            self._buffers["freqs_cis"] = frequencies
+        elif frequencies.device != activation.device:
+            frequencies = frequencies.to(device=activation.device)
+            self._buffers["freqs_cis"] = frequencies
+        frequency_dtype = (
+            torch.complex128 if activation.dtype == torch.float64 else torch.complex64
+        )
+        return frequencies[:sequence_length].to(dtype=frequency_dtype)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -577,7 +696,15 @@ class NeoBERT(NeoBERTPreTrainedModel):
         )
 
         if self.config.rope:
-            self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_length)
+            self.register_buffer(
+                "freqs_cis",
+                precompute_freqs_cis(
+                    config.dim_head,
+                    config.max_length,
+                    dtype=torch.float64,
+                ),
+                persistent=False,
+            )
         else:
             self.positional_embedding = nn.Embedding(config.max_length + 1, config.hidden_size, padding_idx=config.pad_token_id)
 
@@ -602,21 +729,48 @@ class NeoBERT(NeoBERTPreTrainedModel):
         if document_ids is not None:
             if document_ids.shape != src.shape:
                 raise ValueError("document_ids must have the same shape as input_ids")
+            if document_ids.device != src.device:
+                raise ValueError("document_ids must be on the same device as input_ids")
+            if document_ids.dtype not in (
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError("document_ids must use an integer dtype")
             if pad_mask is not None:
                 raise ValueError("packed document_ids cannot be combined with pad_mask")
-            if not uses_only_flex:
-                raise ValueError("packed document masking requires attention_backend='flex'")
+            if any(
+                backend == "flash" for backend in self.config.attention_backends
+            ):
+                raise ValueError(
+                    "packed document masking cannot use direct FlashAttention because "
+                    "FlashAttention does not support arbitrary document masks"
+                )
+        if pad_mask is not None:
+            if pad_mask.shape != src.shape:
+                raise ValueError("pad_mask must have the same shape as input_ids")
+            if pad_mask.device != src.device:
+                raise ValueError("pad_mask must be on the same device as input_ids")
         pad_mask, key_padding_mask = _prepare_attention_masks(
             pad_mask,
             self.config.num_attention_heads,
             src.shape[1],
         )
-        flex_document_ids = document_ids
+        dense_document_mask = None
+        if document_ids is not None and not uses_only_flex:
+            dense_document_mask = _prepare_dense_document_mask(document_ids)
+        flex_document_ids = document_ids if uses_flex else None
         if document_ids is None and key_padding_mask is not None and uses_flex:
             flex_document_ids = _document_ids_from_key_padding_mask(key_padding_mask)
             if uses_only_flex:
                 pad_mask = None
                 key_padding_mask = None
+        elif dense_document_mask is not None:
+            # Non-Flex packed layers receive this one shared real keep-mask.
+            # Flex layers drop it in EncoderBlock and use only their BlockMask.
+            pad_mask = dense_document_mask
         needs_dual_flex_mask = any(
             space == "dual" and backend == "flex"
             for space, backend in zip(
@@ -624,20 +778,25 @@ class NeoBERT(NeoBERTPreTrainedModel):
                 self.config.attention_backends,
             )
         )
-        block_mask, dual_attention_mask = _prepare_document_masks(
+        block_mask, dual_tangent_mask_mod = _prepare_document_masks(
             flex_document_ids,
-            include_dense_mask=needs_dual_flex_mask,
+            include_tangent_mask_mod=needs_dual_flex_mask,
             padding_only=document_ids is None,
         )
-
-        # RoPE
-        freqs_cis = None
-        if self.config.rope:
-            self.freqs_cis = self.freqs_cis.to(src.device, non_blocking=True)
-            freqs_cis = self.freqs_cis[: src.shape[1]]
+        prepared_key_padding_mask = _prepare_backend_padding_metadata(
+            key_padding_mask,
+            self.config.attention_spaces,
+            self.config.attention_backends,
+        )
 
         # Embedding
         x = self.embedding_norm(self.encoder(src))
+
+        # Cast once per model forward, not once per layer. The protected
+        # complex128 master buffer preserves float64 phase accuracy.
+        freqs_cis = None
+        if self.config.rope:
+            freqs_cis = self._rope_frequencies(src.shape[1], x)
 
         # Positional embedding
         if not self.config.rope:
@@ -654,7 +813,8 @@ class NeoBERT(NeoBERTPreTrainedModel):
                 freqs_cis,
                 key_padding_mask,
                 block_mask,
-                dual_attention_mask,
+                dual_tangent_mask_mod,
+                prepared_key_padding_mask,
             )
 
         # Final normalization layer
@@ -675,7 +835,15 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
         self.encoder = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
 
         if self.config.rope:
-            self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_length)
+            self.register_buffer(
+                "freqs_cis",
+                precompute_freqs_cis(
+                    config.dim_head,
+                    config.max_length,
+                    dtype=torch.float64,
+                ),
+                persistent=False,
+            )
         else:
             self.positional_embedding = nn.Embedding(config.max_length + 1, config.hidden_size, padding_idx=config.pad_token_id)
 
@@ -707,6 +875,11 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
         uses_only_flex = all(
             backend == "flex" for backend in self.config.attention_backends
         )
+        if pad_mask is not None:
+            if pad_mask.shape != src.shape:
+                raise ValueError("pad_mask must have the same shape as input_ids")
+            if pad_mask.device != src.device:
+                raise ValueError("pad_mask must be on the same device as input_ids")
         pad_mask, key_padding_mask = _prepare_attention_masks(
             pad_mask,
             self.config.num_attention_heads,
@@ -720,18 +893,21 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
                 key_padding_mask = None
         block_mask, _ = _prepare_document_masks(
             flex_document_ids,
-            include_dense_mask=False,
+            include_tangent_mask_mod=False,
             padding_only=True,
         )
-
-        # RoPE
-        freqs_cis = None
-        if self.config.rope:
-            self.freqs_cis = self.freqs_cis.to(src.device, non_blocking=True)
-            freqs_cis = self.freqs_cis[: src.shape[1]]
+        prepared_key_padding_mask = _prepare_backend_padding_metadata(
+            key_padding_mask,
+            self.config.attention_spaces,
+            self.config.attention_backends,
+        )
 
         # Embedding
         x = self.encoder(src)
+
+        freqs_cis = None
+        if self.config.rope:
+            freqs_cis = self._rope_frequencies(src.shape[1], x)
 
         # Positional embedding
         if not self.config.rope:
@@ -742,7 +918,14 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
 
         # Transformer encoder
         for layer in self.transformer_encoder:
-            x = layer(x, pad_mask, freqs_cis, key_padding_mask, block_mask)
+            x = layer(
+                x,
+                pad_mask,
+                freqs_cis,
+                key_padding_mask,
+                block_mask,
+                prepared_key_padding_mask=prepared_key_padding_mask,
+            )
 
         # Return the output of the last hidden layer
         return x

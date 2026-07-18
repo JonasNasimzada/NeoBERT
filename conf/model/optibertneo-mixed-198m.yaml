@@ -42,6 +42,7 @@ attention_spaces:
   - split
   - split
 attention_backends:
+  # 10 ordinary-complex layers use the packed-document BlockMask.
   - flex
   - flex
   - flex
@@ -52,6 +53,7 @@ attention_backends:
   - flex
   - flex
   - flex
+  # 9 dual-complex layers use the same BlockMask callback in the exact JVP.
   - flex
   - flex
   - flex
@@ -61,13 +63,16 @@ attention_backends:
   - flex
   - flex
   - flex
-  - flex
-  - flex
-  - flex
-  - flex
-  - flex
-  - flex
-  - flex
-  - flex
-  - flex
+  # Split-complex reconstruction must stay widened until its final cast.
+  # These layers therefore use the exact torch path with one shared dense
+  # packed-document keep-mask rather than narrow FlexAttention outputs.
+  - torch
+  - torch
+  - torch
+  - torch
+  - torch
+  - torch
+  - torch
+  - torch
+  - torch
 dual_tangent_chunk_size: 128

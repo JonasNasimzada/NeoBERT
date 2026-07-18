@@ -3,13 +3,21 @@ import torch
 from typing import Tuple
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+def precompute_freqs_cis(
+    dim: int,
+    end: int,
+    theta: float = 10000.0,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str | None = None,
+):
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
     This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
     and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
+    Float64 inputs produce complex128 frequencies; all other supported real
+    input dtypes produce complex64 frequencies.
 
     Args:
         dim (int): Dimension of the frequency tensor.
@@ -20,10 +28,16 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
     """
 
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    return torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    if dim <= 0 or dim % 2 != 0:
+        raise ValueError("RoPE dimension must be a positive even integer")
+    if end < 0:
+        raise ValueError("RoPE sequence length must be nonnegative")
+    real_dtype = torch.float64 if dtype in (torch.float64, torch.complex128) else torch.float32
+    positions = torch.arange(0, dim, 2, dtype=real_dtype, device=device)
+    inverse_frequencies = 1.0 / (theta ** (positions / dim))
+    token_positions = torch.arange(end, dtype=real_dtype, device=device)
+    angles = torch.outer(token_positions, inverse_frequencies)
+    return torch.polar(torch.ones_like(angles), angles)
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -46,13 +60,13 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     """
 
     ndim = x.ndim
-    assert 0 <= 1 < ndim
-    try:
-        assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    except AssertionError:
-        print(freqs_cis.shape)
-        print((x.shape[1], x.shape[-1]))
-        raise AssertionError
+    if ndim < 2:
+        raise ValueError("RoPE input must have at least two dimensions")
+    expected_shape = (x.shape[1], x.shape[-1])
+    if freqs_cis.shape != expected_shape:
+        raise ValueError(
+            f"RoPE frequencies must have shape {expected_shape}, got {tuple(freqs_cis.shape)}"
+        )
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
@@ -78,12 +92,26 @@ def apply_rotary_emb(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
     """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    if xq.shape != xk.shape:
+        raise ValueError("RoPE query and key must have the same shape")
+    if xq.device != xk.device or xq.dtype != xk.dtype:
+        raise ValueError("RoPE query and key must have the same dtype and device")
+    if not torch.is_floating_point(xq):
+        raise ValueError("RoPE query and key must use a real floating-point dtype")
+    if xq.size(-1) % 2 != 0:
+        raise ValueError("RoPE requires an even final dimension")
+
+    compute_dtype = torch.float64 if xq.dtype == torch.float64 else torch.float32
+    complex_dtype = torch.complex128 if compute_dtype == torch.float64 else torch.complex64
+    xq_pairs = xq.to(compute_dtype).reshape(*xq.shape[:-1], -1, 2).contiguous()
+    xk_pairs = xk.to(compute_dtype).reshape(*xk.shape[:-1], -1, 2).contiguous()
+    xq_ = torch.view_as_complex(xq_pairs)
+    xk_ = torch.view_as_complex(xk_pairs)
+    frequencies = freqs_cis.to(device=xq.device, dtype=complex_dtype)
+    frequencies = reshape_for_broadcast(frequencies, xq_)
+    xq_out = torch.view_as_real(xq_ * frequencies).flatten(-2)
+    xk_out = torch.view_as_real(xk_ * frequencies).flatten(-2)
+    return xq_out.to(xq.dtype), xk_out.to(xk.dtype)
 
 
 def apply_rotary_emb_complex(
