@@ -1,0 +1,18 @@
+train:
+  num_workers: 8
+  batch_size: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  pack_sequences: false
+  prepacked_sequences: false
+  max_length: 512
+validation:
+  num_workers: 0
+  batch_size: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+  pack_sequences: false
+  prepacked_sequences: false
+  max_length: 512

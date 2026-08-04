@@ -1,0 +1,4 @@
+warmup_steps: 100
+decay_steps: 1536
+decay: cosine
+final_ratio: 0.1

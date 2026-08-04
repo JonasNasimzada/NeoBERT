@@ -1,0 +1,160 @@
+# Equal-parameter complex-attention ablation
+
+This recipe trains seven homogeneous masked-language models on BabyLM 2026
+Strict. Every encoder layer in a model uses exactly one attention
+space/backend pair.
+
+| Array id | Attention space | Backend | FFN width | Trainable parameters |
+| ---: | --- | --- | ---: | ---: |
+| 0 | ordinary complex | native | 2,049 | 17,260,288 |
+| 1 | ordinary complex | torch | 2,049 | 17,260,288 |
+| 2 | ordinary complex | flash | 2,049 | 17,260,288 |
+| 3 | split complex | native | 2,049 | 17,260,288 |
+| 4 | split complex | torch | 2,049 | 17,260,288 |
+| 5 | dual complex | native | 1,024 | 17,260,288 |
+| 6 | dual complex | torch | 1,024 | 17,260,288 |
+
+All models otherwise use 6 layers, width 256, 8 heads, GELU, RoPE, pre-RMSNorm,
+tied input/output embeddings, no bias in the MLM head, and no dropout. The
+parameter equality is exact; the validator checks both the total and every
+encoder layer before a sweep.
+
+## Packing contract
+
+The preprocessing job concatenates tokenized documents and writes exact
+512-token rows. It drops only the final incomplete tail, so training has no
+padding or unpadding overhead. The same packed rows and deterministic split are
+used by all seven models.
+
+The rows intentionally do **not** contain `document_ids`. Direct Flash SDPA
+cannot represent NeoBERT's block-diagonal document mask. Consequently all seven
+runs allow attention across document boundaries inside a packed row. This is
+the only controlled seven-way comparison that includes `complex/flash` without
+changing the attention semantics for that one run. If document boundaries must
+be isolated, use FlexAttention and treat that as a separate experiment; do not
+label it `flash`.
+
+## Training budget
+
+The default schedule is:
+
+- BabyLM 2026 Strict, pinned in the dataset config;
+- Google BERT uncased tokenizer, vocabulary 30,522, context 512;
+- 20% MLM masking using NeoBERT's 100%-`[MASK]` corruption;
+- micro-batch 8, gradient accumulation 4, effective batch 32;
+- 1,536 optimizer steps, or 25,165,824 token positions;
+- AdamW at `6e-4`, 100 warmup steps, then cosine decay;
+- BF16 with TF32 enabled;
+- deterministic held-out MLM evaluation every 256 steps and at the end.
+
+The 9,900-second training guard leaves about 15 minutes for final validation,
+checkpointing, and export within a three-hour allocation. If a backend reaches
+the guard before step 1,536, its W&B run is marked incomplete. Resume it or
+reduce the common step budget for all variants; never compare runs that saw
+different token counts.
+
+This is a fast architecture probe, not a full-budget BabyLM challenge entry.
+The official corpus is 100M words, while this schedule presents roughly 25.2M
+WordPiece token positions.
+
+## One-time environment and data preparation
+
+Use the custom PyTorch/ComplexAttention environment built for A100 (`sm_80`).
+Do not use the repository's H100-only setup. The jobs expect these variables:
+
+```bash
+export COMPLEX_ATTN_PYTHON=/path/to/the/custom/environment/bin/python
+export COMPLEX_ATTENTION_ROOT=/mnt/nfs/home/st171793/ComplexAttention
+export DATASET_PATH=/shared/path/babylm-2026-strict-bert512-flat
+export HF_HOME=/shared/path/huggingface-cache
+```
+
+Prepare the deterministic train/validation `DatasetDict` once on CPU:
+
+```bash
+sbatch \
+  --partition=slowlane \
+  --qos=hiwi_project \
+  jobs/attention_ablation/prepare_data.sbatch
+```
+
+The output path must not already exist; preprocessing refuses to overwrite it.
+Data download needs a network-enabled job. Training can run with the Hub cache
+offline afterward.
+
+## Validate and submit
+
+The CPU parameter check is safe to run before allocating a GPU:
+
+```bash
+PYTHONPATH="$PWD/src:$COMPLEX_ATTENTION_ROOT" \
+  "$COMPLEX_ATTN_PYTHON" scripts/attention_ablation/validate_variants.py
+```
+
+Before the full run, launch a two-step seven-way A100 smoke array:
+
+```bash
+export SMOKE_RUNS_ROOT=/shared/path/complex-attention-ablation-smoke
+sbatch \
+  --partition=slowlane \
+  --gpus=A100:1 \
+  --qos=hiwi_project \
+  --array=0-6 \
+  --time=00:20:00 \
+  --export=ALL,RUNS_ROOT="$SMOKE_RUNS_ROOT",MAX_STEPS=2,WARMUP_STEPS=1,WANDB_MODE=disabled \
+  jobs/attention_ablation/train.sbatch
+```
+
+Set W&B and output locations, then submit the training array and its correlated
+benchmark array:
+
+```bash
+export RUNS_ROOT=/shared/path/complex-attention-ablation
+export WANDB_PROJECT=complex-attention-ablation
+export WANDB_ENTITY=your-team
+export WANDB_MODE=online
+
+bash jobs/attention_ablation/submit.sh
+```
+
+The submission script uses the requested resource command for both arrays:
+
+```text
+sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-6 ...
+```
+
+Each training task first checks for an A100, SM80 code, BF16 support, and a
+finite forward/backward step for its chosen backend. Run roots and W&B IDs are
+stable by variant and seed, rather than Slurm job id, so a requeued task resumes
+the same checkpoint and W&B run. Set `WANDB_MODE=offline` on isolated compute
+nodes and run `wandb sync` later from a network-enabled node.
+
+## Logged measurements
+
+The training run logs resolved configuration, space/backend, exact parameter
+counts, Slurm/GPU/runtime metadata, loss, pseudo-perplexity, masked accuracy,
+learning rate, gradient/weight norms, cumulative samples/tokens, step time,
+tokens/s, sequences/s, and peak CUDA memory. Validation corruption is reset to
+the same seed on every evaluation.
+
+The dependent benchmark job evaluates the final export at contexts 128, 256,
+and 512 with deterministic masking and an equal token budget. It writes a JSON
+report, logs all scalar metrics to a W&B `benchmark` run in the same group, and
+uploads the report as an artifact.
+
+For the official BabyLM zero-shot suite, prepare and pin a checkout of
+`babylm-org/babylm-eval`, download its evaluation data (including any gated
+assets), and export `BABYLM_EVAL_ROOT` before submission. The benchmark job will
+run the MLM zero-shot script when that variable is present, then upload parsed
+metrics and the complete official result directory to W&B. Keep the evaluator
+commit in the run notes so scores remain reproducible.
+
+The official harness pads variable-length MLM batches. For the strict
+`complex/flash` checkpoint, a scoped evaluator-only adapter runs each padded
+row at its true length and restores batch-shaped logits. This preserves the
+selected Flash backend and avoids silently falling back to Torch SDPA.
+
+`complex/torch` permits PyTorch's normal SDPA selection and may itself choose a
+Flash kernel on A100; `complex/flash` is the strict selector. Treat their quality
+as equivalent implementations and use the runtime/memory logs to distinguish
+dispatch behavior.

@@ -1,0 +1,35 @@
+tf32: true
+mixed_precision: bf16
+resume: true
+disable_tqdm: false
+
+# 1,536 * 32 sequences/update * 512 tokens = 25,165,824 token positions.
+max_steps: 1536
+gradient_accumulation_steps: 4
+gradient_clipping: 1.0
+
+# Stop training early enough to run the final validation and atomic export in
+# a three-hour allocation. A time-limited run is marked incomplete and can be
+# resumed; do not compare it with completed runs until it reaches max_steps.
+max_time_seconds: 9900
+
+# Compilation is intentionally disabled for the first controlled sweep. The
+# custom native operators and torch.func.jvp path should be measured directly.
+compile: false
+compile_fullgraph: false
+find_unused_parameters: false
+
+validation:
+  eval_steps: 256
+  max_batches: 32
+  seed: 314159
+
+accelerate:
+  save_steps: 256
+  max_ckpt: 3
+model:
+  save_steps: 256
+  max_ckpt: 7
+  save_at_end: true
+  export_at_end: true
+dir: logs/attention_ablation/unset

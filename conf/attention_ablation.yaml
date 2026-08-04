@@ -1,0 +1,32 @@
+defaults:
+  - _self_
+  - dataset: babylm_2026_strict
+  - tokenizer: google-512
+  - model: attention-ablation-complex
+  - optimizer: attention-ablation
+  - scheduler: attention-ablation
+  - trainer: attention-ablation
+  - dataloader: attention-ablation
+  - datacollator: mlm_20
+
+seed: 42
+
+hydra:
+  run:
+    dir: ${trainer.dir}/hydra
+
+wandb:
+  id: null
+  resume: allow
+  name: null
+  group: complex-attention-babylm-2026
+  job_type: pretraining
+  project: complex-attention-ablation
+  entity: null
+  tags:
+    - babylm-2026-strict
+    - padding-free-packing
+    - equal-parameters
+  dir: ${oc.env:WANDB_DIR,logs/wandb}
+  mode: ${oc.env:WANDB_MODE,online}
+  log_interval: 20

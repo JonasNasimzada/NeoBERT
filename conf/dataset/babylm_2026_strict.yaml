@@ -1,0 +1,14 @@
+name: babylm_2026_strict
+column: text
+path_to_disk: tokenized_datasets/babylm_2026_strict_google_512
+pack_to_length: 512
+cross_document_attention: true
+validation_fraction: 0.01
+validation_seed: 0
+train_split: train
+validation_split: validation
+require_manifest: true
+train:
+  path: BabyLM-community/BabyLM-2026-Strict
+  split: train
+  revision: 9e57baaaa91ac3c638746be14d1d5fa6c789f4cf

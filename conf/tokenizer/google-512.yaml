@@ -1,0 +1,6 @@
+pretrained_model_name_or_path: google-bert/bert-base-uncased
+revision: 86b5e0934494bd15c9632b12f734a8a67f723594
+trust_remote_code: True
+max_length: 512
+chunk_long_documents: true
+vocab_size: 30522
