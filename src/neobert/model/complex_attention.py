@@ -53,6 +53,7 @@ class NeoBERTComplexAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.dim_head
         self.rope = config.rope
+        self.attention_dropout = float(getattr(config, "attention_dropout", 0.0))
         self.dual_tangent_chunk_size = config.dual_tangent_chunk_size
         self._complex_attention = complex_attention
         self._split_attention = split_complex_attention
@@ -135,6 +136,7 @@ class NeoBERTComplexAttention(nn.Module):
             attn_mask=direct_mask,
             key_padding_mask=direct_key_padding,
             scale=self.head_dim**-0.5,
+            dropout_p=self.attention_dropout if self.training else 0.0,
             backend=self.backend,
             block_mask=block_mask,
             prepared_key_padding_mask=direct_prepared_padding,
@@ -169,6 +171,7 @@ class NeoBERTComplexAttention(nn.Module):
             attn_mask=direct_mask,
             key_padding_mask=direct_key_padding,
             scale=self.head_dim**-0.5,
+            dropout_p=self.attention_dropout if self.training else 0.0,
             backend=self.backend,
             block_mask=block_mask,
             prepared_key_padding_mask=direct_prepared_padding,
@@ -183,7 +186,6 @@ class NeoBERTComplexAttention(nn.Module):
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         block_mask: Any,
-        tangent_mask_mod: Any,
     ) -> Tensor:
         qkv_primal, qkv_dual = self.qkv.forward_real(x)
         primal_parts = tuple(_reshape_qkv(component, self.num_heads, self.head_dim) for component in qkv_primal)
@@ -210,10 +212,10 @@ class NeoBERTComplexAttention(nn.Module):
             attn_mask=direct_mask,
             key_padding_mask=direct_key_padding,
             scale=self.head_dim**-0.5,
+            dropout_p=self.attention_dropout if self.training else 0.0,
             backend=self.backend,
             tangent_chunk_size=self.dual_tangent_chunk_size,
             block_mask=block_mask,
-            tangent_mask_mod=tangent_mask_mod,
         )
         output = tuple(
             tuple(_from_attention_layout(component) for component in pair)
@@ -228,11 +230,8 @@ class NeoBERTComplexAttention(nn.Module):
         key_padding_mask: Optional[Tensor],
         freqs_cis: Optional[Tensor],
         block_mask: Any = None,
-        tangent_mask_mod: Any = None,
         prepared_key_padding_mask: Any = None,
     ) -> Tensor:
-        if self.space != "dual" and tangent_mask_mod is not None:
-            raise ValueError("tangent_mask_mod is only valid for dual-complex attention")
         if key_padding_mask is None and prepared_key_padding_mask is not None:
             key_padding_mask = getattr(
                 prepared_key_padding_mask,
@@ -267,5 +266,4 @@ class NeoBERTComplexAttention(nn.Module):
             key_padding_mask,
             freqs_cis,
             block_mask,
-            tangent_mask_mod,
         )

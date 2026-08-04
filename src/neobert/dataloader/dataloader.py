@@ -24,6 +24,8 @@ def get_dataloader(
     pack_sequences: bool = False,
     prepacked_sequences: bool = False,
     max_length: int = 512,
+    seed: int | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.utils.data.DataLoader:
     """Wrapper for constructing a ``torch`` dataloader, with a collator function applying masked language modeling and returning an additive pad mask.
 
@@ -39,10 +41,20 @@ def get_dataloader(
         shuffle (bool, optional): Whether to shuffle the dataset at the beginning of every epoch. Defaults to True.
         pin_memory (bool, optional): If True, the dataloader will copy Tensors into device/CUDA pinned memory before returning them. Defaults to False.
         persistent_workers (bool, optional): If True, the dataloader will not shut down the worker processes after a dataset has been consumed once. This allows to maintain the workers Dataset instances alive. Defaults to True.
+        seed (int, optional): Seed for a private dataloader RNG. This makes
+            shuffling and worker seeds independent of model-initialization RNG.
+        generator (torch.Generator, optional): Explicit private dataloader RNG.
+            Mutually exclusive with ``seed``.
 
     Returns:
         torch.utils.data.DataLoader
     """
+
+    if seed is not None and generator is not None:
+        raise ValueError("pass either seed or generator, not both")
+    if generator is None and seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
 
     collate_fn = get_collator(
         dtype=dtype,
@@ -63,6 +75,7 @@ def get_dataloader(
         shuffle=shuffle,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        generator=generator,
     )
 
     return dataloader

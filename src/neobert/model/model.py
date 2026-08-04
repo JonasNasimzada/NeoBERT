@@ -22,7 +22,7 @@ except (ImportError, OSError):
 from datasets import Dataset
 
 from transformers import PreTrainedModel, PretrainedConfig, PreTrainedTokenizerFast, DataCollatorWithPadding
-from transformers.modeling_outputs import SequenceClassifierOutput
+from transformers.modeling_outputs import MaskedLMOutput, SequenceClassifierOutput
 
 from tqdm import tqdm
 
@@ -119,9 +119,9 @@ def _prepare_attention_masks(pad_mask, num_heads, seq_len):
     return attention_bias, key_padding_mask
 
 
-def _prepare_document_masks(document_ids, include_tangent_mask_mod, padding_only=False):
+def _prepare_document_masks(document_ids, padding_only=False):
     if document_ids is None:
-        return None, None
+        return None
     if document_ids.dim() != 2:
         raise ValueError("document_ids must have shape (batch, sequence)")
     if document_ids.dtype not in (
@@ -143,7 +143,7 @@ def _prepare_document_masks(document_ids, include_tangent_mask_mod, padding_only
         return (query_document == key_document) & (query_document >= 0)
 
     batch_size, sequence_length = document_ids.shape
-    block_mask = create_block_mask(
+    return create_block_mask(
         document_mask,
         B=batch_size,
         H=1,
@@ -151,11 +151,6 @@ def _prepare_document_masks(document_ids, include_tangent_mask_mod, padding_only
         KV_LEN=sequence_length,
         device=document_ids.device,
     )
-    # Return the exact same callable stored by BlockMask.  Dual attention uses
-    # it to construct each tangent tile lazily, which guarantees primal and
-    # tangent masking are identical without allocating a dense B x L x L mask.
-    tangent_mask_mod = document_mask if include_tangent_mask_mod else None
-    return block_mask, tangent_mask_mod
 
 
 def _prepare_dense_document_mask(document_ids, padding_only=False):
@@ -191,7 +186,7 @@ def _prepare_backend_padding_metadata(key_padding_mask, attention_spaces, attent
     if key_padding_mask is None:
         return None
     needs_metadata = any(
-        backend in ("flash", "xformers") and space in ("real", "complex")
+        backend == "flash" and space in ("real", "complex")
         for space, backend in zip(attention_spaces, attention_backends)
     )
     if not needs_metadata:
@@ -200,7 +195,7 @@ def _prepare_backend_padding_metadata(key_padding_mask, attention_spaces, attent
         from complex_attention import prepare_key_padding_mask
     except (ImportError, OSError) as error:
         raise ImportError(
-            "Install ComplexAttention before using FlashAttention/xFormers padding metadata"
+            "Install ComplexAttention before using FlashAttention padding metadata"
         ) from error
     return prepare_key_padding_mask(key_padding_mask)
 
@@ -216,11 +211,12 @@ def _real_attention(
     backend=None,
     block_mask=None,
     prepared_key_padding_mask=None,
+    dropout_p=0.0,
 ):
     backend = config.attention_backend if backend is None else backend
     if backend == "auto":
         backend = "torch"
-    if backend not in ("torch", "xformers", "flash", "flex"):
+    if backend not in ("torch", "flash", "flex"):
         raise ValueError(f"unsupported real attention backend: {backend}")
     if backend == "flex":
         if attn_bias is not None or key_padding_mask is not None:
@@ -238,6 +234,7 @@ def _real_attention(
         attn_mask=attn_bias,
         key_padding_mask=key_padding_mask,
         scale=scale,
+        dropout_p=dropout_p,
         backend=backend,
         block_mask=block_mask if backend == "flex" else None,
         prepared_key_padding_mask=(
@@ -248,6 +245,7 @@ def _real_attention(
 
 class NeoBERTConfig(PretrainedConfig):
     model_type = "neobert"
+    _auto_class = "AutoConfig"
 
     # All config parameters must have a default value.
     def __init__(
@@ -257,6 +255,7 @@ class NeoBERTConfig(PretrainedConfig):
         num_attention_heads: int = 12,
         intermediate_size: int = 3072,
         dropout: float = 0,
+        attention_dropout: float = 0,
         embedding_init_range: float = 0.02,
         decoder_init_range: float = 0.02,
         rms_norm: bool = True,
@@ -296,6 +295,13 @@ class NeoBERTConfig(PretrainedConfig):
             raise ValueError("RoPE requires an even attention head dimension.")
         self.intermediate_size = intermediate_size
         self.dropout = dropout
+        try:
+            attention_dropout = float(attention_dropout)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise ValueError("attention_dropout must be a finite probability in [0, 1)") from error
+        if not math.isfinite(attention_dropout) or not 0.0 <= attention_dropout < 1.0:
+            raise ValueError("attention_dropout must be a finite probability in [0, 1)")
+        self.attention_dropout = attention_dropout
         self.embedding_init_range = embedding_init_range
         self.decoder_init_range = decoder_init_range
         self.rms_norm = rms_norm
@@ -309,12 +315,18 @@ class NeoBERTConfig(PretrainedConfig):
             raise ValueError("flash_attention must be a bool or None")
         self.flash_attention = flash_attention
         valid_spaces = ("real", "complex", "split", "dual")
-        valid_backends = ("auto", "native", "reference", "torch", "xformers", "flash", "flex")
+        valid_backends = ("auto", "native", "torch", "flash", "flex")
+        supported_backends = {
+            "real": ("auto", "torch", "flash", "flex"),
+            "complex": ("auto", "native", "torch", "flash", "flex"),
+            "split": ("auto", "native", "torch", "flex"),
+            "dual": ("auto", "native", "torch", "flex"),
+        }
         if attention_space not in valid_spaces:
             raise ValueError("attention_space must be 'real', 'complex', 'split', or 'dual'")
         if attention_backend not in valid_backends:
             raise ValueError(
-                "attention_backend must be 'auto', 'native', 'reference', 'torch', 'xformers', 'flash', or 'flex'"
+                "attention_backend must be 'auto', 'native', 'torch', 'flash', or 'flex'"
             )
         if dual_tangent_chunk_size <= 0:
             raise ValueError("dual_tangent_chunk_size must be positive")
@@ -323,9 +335,8 @@ class NeoBERTConfig(PretrainedConfig):
             and attention_backend == "auto"
             and flash_attention is not None
         ):
-            # Backward compatibility: the historical flag selected xFormers'
-            # memory-efficient attention, not the separate FlashAttention API.
-            attention_backend = "xformers" if flash_attention else "torch"
+            # Backward compatibility for configs that predate attention_backend.
+            attention_backend = "flash" if flash_attention else "torch"
         if attention_spaces is None:
             attention_spaces = [attention_space] * num_hidden_layers
         if attention_backends is None:
@@ -339,21 +350,26 @@ class NeoBERTConfig(PretrainedConfig):
         if any(backend not in valid_backends for backend in attention_backends):
             raise ValueError("attention_backends contains an unknown backend")
         for layer_space, layer_backend in zip(attention_spaces, attention_backends):
-            if layer_space == "real" and layer_backend in ("native", "reference"):
-                raise ValueError("real layers support auto, torch, xformers, flash, or flex")
-            if layer_space == "complex" and layer_backend == "reference":
+            if layer_backend not in supported_backends[layer_space]:
+                space_name = {
+                    "real": "real",
+                    "complex": "ordinary complex",
+                    "split": "split-complex",
+                    "dual": "dual-complex",
+                }[layer_space]
+                allowed = supported_backends[layer_space]
                 raise ValueError(
-                    "ordinary complex layers support auto, native, torch, xformers, flash, or flex"
+                    f"{space_name} layers support only "
+                    f"{', '.join(allowed[:-1])}, or {allowed[-1]}"
                 )
-            if layer_space == "split" and layer_backend in (
-                "reference",
-                "xformers",
-                "flash",
-                "flex",
+            if (
+                attention_dropout > 0.0
+                and layer_backend == "flex"
+                and layer_space in ("real", "complex", "split")
             ):
                 raise ValueError(
-                    "split-complex layers support only auto, native, or torch; "
-                    "narrow fused backends cannot preserve exact idempotent reconstruction"
+                    "real, ordinary-complex, and split-complex FlexAttention "
+                    "do not support attention_dropout"
                 )
         self.attention_space = attention_space
         self.attention_backend = attention_backend
@@ -437,7 +453,6 @@ class EncoderBlock(nn.Module):
         freqs_cis: torch.Tensor,
         key_padding_mask: torch.Tensor = None,
         block_mask=None,
-        dual_tangent_mask_mod=None,
         prepared_key_padding_mask=None,
     ):
         x = x + self._att_block(
@@ -446,7 +461,6 @@ class EncoderBlock(nn.Module):
             freqs_cis,
             key_padding_mask,
             block_mask,
-            dual_tangent_mask_mod,
             prepared_key_padding_mask,
         )
         x = x + self._ff_block(self.ffn_norm(x))
@@ -459,17 +473,13 @@ class EncoderBlock(nn.Module):
         freqs_cis: torch.Tensor,
         key_padding_mask: torch.Tensor = None,
         block_mask=None,
-        dual_tangent_mask_mod=None,
         prepared_key_padding_mask=None,
     ):
         layer_block_mask = block_mask if self.attention_backend == "flex" else None
         if self.complex_attention is not None:
             attention_mask = None if key_padding_mask is not None else pad_mask
-            tangent_mask_mod = None
             if self.attention_backend == "flex":
                 attention_mask = None
-                if self.attention_space == "dual":
-                    tangent_mask_mod = dual_tangent_mask_mod
             return self.resid_dropout(
                 self.complex_attention(
                     x,
@@ -477,7 +487,6 @@ class EncoderBlock(nn.Module):
                     key_padding_mask,
                     freqs_cis,
                     layer_block_mask,
-                    tangent_mask_mod,
                     prepared_key_padding_mask,
                 )
             )
@@ -503,6 +512,7 @@ class EncoderBlock(nn.Module):
             backend=self.attention_backend,
             block_mask=layer_block_mask,
             prepared_key_padding_mask=direct_prepared_padding,
+            dropout_p=self.config.attention_dropout if self.training else 0.0,
         )
 
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head)))
@@ -631,6 +641,7 @@ class NormEncoderBlock(nn.Module):
             backend=self.attention_backend,
             block_mask=layer_block_mask,
             prepared_key_padding_mask=direct_prepared_padding,
+            dropout_p=self.config.attention_dropout if self.training else 0.0,
         )
 
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.hidden_size)))
@@ -817,23 +828,15 @@ class NeoBERT(NeoBERTPreTrainedModel):
             # Non-Flex packed layers receive this one shared real keep-mask.
             # Flex layers drop it in EncoderBlock and use only their BlockMask.
             pad_mask = dense_document_mask
-        needs_dual_flex_mask = any(
-            space == "dual" and backend == "flex"
-            for space, backend in zip(
-                self.config.attention_spaces,
-                self.config.attention_backends,
-            )
-        )
-        block_mask, dual_tangent_mask_mod = _prepare_document_masks(
+        block_mask = _prepare_document_masks(
             flex_document_ids,
-            include_tangent_mask_mod=needs_dual_flex_mask,
             padding_only=document_ids is None,
         )
-        prepared_key_padding_mask = _prepare_backend_padding_metadata(
-            key_padding_mask,
-            self.config.attention_spaces,
-            self.config.attention_backends,
-        )
+        # Current SDPA/Flash routes do not consume the Python metadata and its
+        # eager nonzero()/tolist() preparation breaks full-graph compilation.
+        # Keep the public helper for external callers, but do not prepare dead
+        # metadata on every model forward.
+        prepared_key_padding_mask = None
 
         # Embedding
         x = self.embedding_norm(self.encoder(src))
@@ -859,7 +862,6 @@ class NeoBERT(NeoBERTPreTrainedModel):
                 freqs_cis,
                 key_padding_mask,
                 block_mask,
-                dual_tangent_mask_mod,
                 prepared_key_padding_mask,
             )
 
@@ -937,16 +939,13 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
             if uses_only_flex:
                 pad_mask = None
                 key_padding_mask = None
-        block_mask, _ = _prepare_document_masks(
+        block_mask = _prepare_document_masks(
             flex_document_ids,
-            include_tangent_mask_mod=False,
             padding_only=True,
         )
-        prepared_key_padding_mask = _prepare_backend_padding_metadata(
-            key_padding_mask,
-            self.config.attention_spaces,
-            self.config.attention_backends,
-        )
+        # Match standard NeoBERT: current SDPA/Flash routes do not consume this
+        # Python metadata, and preparing it eagerly breaks full-graph compilation.
+        prepared_key_padding_mask = None
 
         # Embedding
         x = self.encoder(src)
@@ -979,6 +978,7 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
 
 class NeoBERTLMHead(NeoBERTPreTrainedModel):
     config_class = NeoBERTConfig
+    _auto_class = "AutoModelForMaskedLM"
     _tied_weights_keys = ["decoder.weight"]
 
     def __init__(self, config: NeoBERTConfig):
@@ -1009,11 +1009,68 @@ class NeoBERTLMHead(NeoBERTPreTrainedModel):
     def set_output_embeddings(self, decoder):
         self.decoder = decoder
 
-    def forward(self, src, pad_mask=None, document_ids=None):
+    def forward(
+        self,
+        src=None,
+        pad_mask=None,
+        document_ids=None,
+        *,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs,
+    ):
+        """Run MLM with the compact NeoBERT API or Hugging Face keywords."""
+        if kwargs:
+            unsupported = ", ".join(sorted(kwargs))
+            raise TypeError(f"unsupported NeoBERTLMHead arguments: {unsupported}")
+        if src is not None and input_ids is not None:
+            raise ValueError("pass either src or input_ids, not both")
+        if pad_mask is not None and attention_mask is not None:
+            raise ValueError("pass either pad_mask or attention_mask, not both")
+        if src is None:
+            src = input_ids
+        if pad_mask is None:
+            pad_mask = attention_mask
+        if src is None:
+            raise ValueError("src or input_ids is required")
+        if inputs_embeds is not None:
+            raise ValueError("NeoBERTLMHead does not accept inputs_embeds")
+        if position_ids is not None:
+            raise ValueError("NeoBERT computes RoPE positions internally")
+        if head_mask is not None:
+            raise ValueError("NeoBERTLMHead does not accept head_mask")
+        # BERT tokenizers emit token_type_ids by default. NeoBERT has no
+        # segment embedding, so accepting and ignoring them is intentional.
+        del token_type_ids, output_attentions
+
         hidden_representation = self.model.forward(src, pad_mask, document_ids)
         logits = self.decoder(hidden_representation)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
 
-        return {"hidden_representation": hidden_representation, "logits": logits}
+        return_dict = self.config.use_return_dict if return_dict is None else return_dict
+        if not return_dict:
+            output = (logits, hidden_representation)
+            return ((loss,) + output) if loss is not None else output
+        return MaskedLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=(hidden_representation,) if output_hidden_states else None,
+            attentions=None,
+        )
 
 
 class NeoBERTForSequenceClassification(NeoBERTPreTrainedModel):
@@ -1245,9 +1302,9 @@ class NeoBERTForMTEB(NeoBERTPreTrainedModel):
             input_ids = batch["input_ids"].to(device)
 
             pad_mask = batch["attention_mask"].to(device)
-            xformers_mask = torch.where(pad_mask == 1, float(0.0), float("-inf")).type(torch.float16)
+            additive_mask = torch.where(pad_mask == 1, float(0.0), float("-inf")).type(torch.float16)
 
-            outputs = self.model(input_ids, xformers_mask)
+            outputs = self.model(input_ids, additive_mask)
 
             if self.pooling == "avg":
                 outputs = outputs * pad_mask.unsqueeze(-1).expand(-1, -1, outputs.shape[-1])

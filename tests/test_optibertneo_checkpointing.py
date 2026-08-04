@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 from accelerate.utils import DistributedType
+from transformers import AutoModelForMaskedLM
 
 from neobert.model import NeoBERTConfig, NeoBERTLMHead
 from neobert.optimizer import get_optimizer
@@ -15,6 +16,7 @@ from neobert.pretraining.metrics import Metrics
 from neobert.pretraining.trainer import (
     _state_dict_without_compile_prefix,
     discover_resume_checkpoint,
+    ensure_babylm_auto_map,
 )
 
 
@@ -30,8 +32,9 @@ class TestOptiBERTneoCheckpointing(unittest.TestCase):
                     raise AssertionError(f"unexpected dtype: {value.dtype}")
                 return value
 
-            def log(self, values):
+            def log(self, values, step=None):
                 self.logged = values
+                self.logged_step = step
 
         accelerator = AcceleratorStub()
         metrics = Metrics()
@@ -107,6 +110,7 @@ class TestOptiBERTneoCheckpointing(unittest.TestCase):
             attention_backend="torch",
         )
         model = NeoBERTLMHead(config)
+        ensure_babylm_auto_map(model.config)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             model.save_pretrained(
@@ -121,6 +125,33 @@ class TestOptiBERTneoCheckpointing(unittest.TestCase):
                 loaded.decoder.weight,
                 loaded.model.encoder.weight,
             )
+            self.assertEqual(
+                loaded.config.auto_map,
+                {
+                    "AutoConfig": "model.NeoBERTConfig",
+                    "AutoModelForMaskedLM": "model.NeoBERTLMHead",
+                    "AutoModelForSequenceClassification": (
+                        "model.NeoBERTHFForSequenceClassification"
+                    ),
+                },
+            )
+            auto_loaded = AutoModelForMaskedLM.from_pretrained(
+                temporary_directory,
+                trust_remote_code=True,
+            )
+            input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+            labels = torch.tensor([[-100, 2, -100, 4]], dtype=torch.long)
+            output = auto_loaded(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                token_type_ids=torch.zeros_like(input_ids),
+                labels=labels,
+            )
+            self.assertEqual(
+                tuple(output.logits.shape),
+                (1, 4, config.vocab_size),
+            )
+            self.assertTrue(torch.isfinite(output.loss))
 
 
 if __name__ == "__main__":

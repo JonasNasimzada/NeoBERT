@@ -25,14 +25,12 @@ class RecordingLayer(nn.Module):
         freqs_cis,
         key_padding_mask,
         block_mask,
-        dual_tangent_mask_mod,
         prepared_key_padding_mask,
     ):
         self.arguments = (
             pad_mask,
             key_padding_mask,
             block_mask,
-            dual_tangent_mask_mod,
             prepared_key_padding_mask,
         )
         return x
@@ -44,7 +42,6 @@ class RecordingAttention(nn.Module):
         self.attn_mask = None
         self.key_padding_mask = None
         self.block_mask = None
-        self.tangent_mask_mod = None
         self.prepared_key_padding_mask = None
 
     def forward(
@@ -54,19 +51,17 @@ class RecordingAttention(nn.Module):
         key_padding_mask,
         freqs_cis,
         block_mask,
-        tangent_mask_mod=None,
         prepared_key_padding_mask=None,
     ):
         self.attn_mask = attn_mask
         self.key_padding_mask = key_padding_mask
         self.block_mask = block_mask
-        self.tangent_mask_mod = tangent_mask_mod
         self.prepared_key_padding_mask = prepared_key_padding_mask
         return torch.zeros_like(x)
 
 
 class TestComplexAttentionIntegration(unittest.TestCase):
-    def test_shipped_mixed_config_uses_widened_split_backend(self):
+    def test_shipped_mixed_config_uses_flex_for_every_layer(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "conf"
@@ -101,21 +96,67 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             attention_backends=attention_backends,
         )
 
-        split_backends = [
-            backend
-            for space, backend in zip(
-                config.attention_spaces,
-                config.attention_backends,
-            )
-            if space == "split"
-        ]
-        self.assertEqual(split_backends, ["torch"] * 9)
+        self.assertEqual(config.attention_backends, ["flex"] * 28)
 
-    def test_split_layers_reject_narrow_fused_backends(self):
-        for backend in ("reference", "xformers", "flash", "flex"):
-            with self.subTest(backend=backend), self.assertRaisesRegex(
+    def test_config_enforces_backend_matrix(self):
+        backend_matrix = {
+            "real": ("auto", "torch", "flash", "flex"),
+            "complex": ("auto", "native", "torch", "flash", "flex"),
+            "split": ("auto", "native", "torch", "flex"),
+            "dual": ("auto", "native", "torch", "flex"),
+        }
+        all_backends = {"auto", "native", "torch", "flash", "flex"}
+        space_names = {
+            "real": "real",
+            "complex": "ordinary complex",
+            "split": "split-complex",
+            "dual": "dual-complex",
+        }
+
+        for space, allowed in backend_matrix.items():
+            with self.subTest(space=space, accepted=True):
+                config = NeoBERTConfig(
+                    hidden_size=8,
+                    num_hidden_layers=len(allowed),
+                    num_attention_heads=2,
+                    intermediate_size=16,
+                    hidden_act="gelu",
+                    vocab_size=32,
+                    max_length=8,
+                    rope=False,
+                    attention_spaces=[space] * len(allowed),
+                    attention_backends=list(allowed),
+                )
+                self.assertEqual(config.attention_backends, list(allowed))
+
+            for backend in sorted(all_backends.difference(allowed)):
+                with self.subTest(space=space, backend=backend), self.assertRaisesRegex(
+                    ValueError,
+                    rf"{space_names[space]} layers support only",
+                ):
+                    NeoBERTConfig(
+                        hidden_size=8,
+                        num_hidden_layers=1,
+                        num_attention_heads=2,
+                        intermediate_size=16,
+                        hidden_act="gelu",
+                        vocab_size=32,
+                        max_length=8,
+                        rope=False,
+                        attention_spaces=[space],
+                        attention_backends=[backend],
+                    )
+
+    def test_removed_attention_backend_identifiers_are_rejected(self):
+        for backend in ("reference", "xformers"):
+            with self.subTest(backend=backend, scalar=True), self.assertRaisesRegex(
                 ValueError,
-                "split-complex layers support only auto, native, or torch",
+                "attention_backend must be 'auto', 'native', 'torch', 'flash', or 'flex'",
+            ):
+                NeoBERTConfig(attention_backend=backend)
+            with self.subTest(backend=backend, schedule=True), self.assertRaisesRegex(
+                ValueError,
+                "attention_backends contains an unknown backend",
             ):
                 NeoBERTConfig(
                     hidden_size=8,
@@ -126,7 +167,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
                     vocab_size=32,
                     max_length=8,
                     rope=False,
-                    attention_spaces=["split"],
+                    attention_spaces=["complex"],
                     attention_backends=[backend],
                 )
 
@@ -138,6 +179,102 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             with self.subTest(**kwargs):
                 with self.assertRaises(ValueError):
                     NeoBERTConfig(**kwargs)
+
+    def test_config_validates_attention_dropout(self):
+        self.assertEqual(NeoBERTConfig().attention_dropout, 0.0)
+        self.assertEqual(NeoBERTConfig(attention_dropout=0.25).attention_dropout, 0.25)
+        for value in (-0.1, 1.0, float("nan"), float("inf"), "invalid"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "attention_dropout"
+            ):
+                NeoBERTConfig(attention_dropout=value)
+        for space in ("real", "complex", "split"):
+            with self.subTest(space=space), self.assertRaisesRegex(
+                ValueError, "FlexAttention.*attention_dropout"
+            ):
+                NeoBERTConfig(
+                    num_hidden_layers=1,
+                    attention_dropout=0.1,
+                    attention_spaces=[space],
+                    attention_backends=["flex"],
+                )
+        dual_flex = NeoBERTConfig(
+            num_hidden_layers=1,
+            attention_dropout=0.1,
+            attention_spaces=["dual"],
+            attention_backends=["flex"],
+        )
+        self.assertEqual(dual_flex.attention_dropout, 0.1)
+
+    def test_complex_adapters_apply_attention_dropout_only_while_training(self):
+        for space in ("complex", "split", "dual"):
+            with self.subTest(space=space):
+                config = NeoBERTConfig(
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=16,
+                    hidden_act="gelu",
+                    vocab_size=32,
+                    max_length=8,
+                    rope=False,
+                    attention_dropout=0.25,
+                    attention_spaces=[space],
+                    attention_backends=["torch"],
+                )
+                attention = model_module.NeoBERTComplexAttention(
+                    config,
+                    attention_space=space,
+                    attention_backend="torch",
+                )
+                captured = []
+
+                def fake_attention(query, key, value, **kwargs):
+                    captured.append(kwargs["dropout_p"])
+                    return value, None
+
+                setattr(attention, f"_{space}_attention", fake_attention)
+                inputs = torch.randn(2, 4, 8)
+                attention.train()
+                attention(inputs, None, None, None)
+                attention.eval()
+                attention(inputs, None, None, None)
+                self.assertEqual(captured, [0.25, 0.0])
+
+    def test_real_blocks_apply_attention_dropout_only_while_training(self):
+        config = NeoBERTConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            hidden_act="gelu",
+            vocab_size=32,
+            max_length=8,
+            rope=False,
+            attention_dropout=0.25,
+            attention_spaces=["real"],
+            attention_backends=["torch"],
+        )
+        inputs = torch.randn(2, 4, 8)
+
+        for block_type in (model_module.EncoderBlock, model_module.NormEncoderBlock):
+            with self.subTest(block_type=block_type.__name__):
+                block = block_type(config, 0)
+                captured = []
+
+                def fake_attention(query, key, value, *args, **kwargs):
+                    captured.append(kwargs["dropout_p"])
+                    return torch.zeros_like(query)
+
+                with mock.patch.object(
+                    model_module, "_real_attention", side_effect=fake_attention
+                ):
+                    block.train()
+                    block._att_block(inputs, None, None)
+                    block.eval()
+                    block._att_block(inputs, None, None)
+
+                self.assertEqual(captured, [0.25, 0.0])
 
     def test_all_zero_floating_padding_mask_is_binary_and_fully_padded(self):
         bias, key_padding_mask = model_module._prepare_attention_masks(
@@ -202,14 +339,14 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         torch.testing.assert_close(actual_bias, expected_bias)
         torch.testing.assert_close(actual_padding, expected_padding)
 
-    def test_legacy_flash_flag_maps_to_historical_backend(self):
-        xformers_config = NeoBERTConfig(flash_attention=True)
+    def test_legacy_flash_flag_maps_to_flash_backend(self):
+        flash_config = NeoBERTConfig(flash_attention=True)
         torch_config = NeoBERTConfig(flash_attention=False)
         modern_config = NeoBERTConfig(
             flash_attention=True,
             attention_backend="torch",
         )
-        self.assertTrue(all(value == "xformers" for value in xformers_config.attention_backends))
+        self.assertTrue(all(value == "flash" for value in flash_config.attention_backends))
         self.assertTrue(all(value == "torch" for value in torch_config.attention_backends))
         self.assertTrue(all(value == "torch" for value in modern_config.attention_backends))
 
@@ -296,6 +433,67 @@ class TestComplexAttentionIntegration(unittest.TestCase):
                             for name, parameter in attention.named_parameters()
                         )
                     )
+
+    def test_nonzero_attention_dropout_models_take_optimizer_steps(self):
+        input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        labels = torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]])
+        combinations = (
+            ("real", "torch"),
+            ("complex", "torch"),
+            ("complex", "native"),
+            ("split", "torch"),
+            ("split", "native"),
+            ("dual", "torch"),
+            ("dual", "native"),
+        )
+
+        for index, (space, backend) in enumerate(combinations):
+            with self.subTest(space=space, backend=backend):
+                torch.manual_seed(8000 + index)
+                config = NeoBERTConfig(
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=16,
+                    hidden_act="gelu",
+                    vocab_size=19,
+                    max_length=4,
+                    rope=False,
+                    dropout=0.0,
+                    attention_dropout=0.25,
+                    attention_space=space,
+                    attention_backend=backend,
+                )
+                model = NeoBERTLMHead(config).train()
+                block = model.model.transformer_encoder[0]
+                attention_parameters = {
+                    name: parameter
+                    for name, parameter in block.named_parameters()
+                    if name.startswith(("qkv.", "wo.", "complex_attention."))
+                }
+                before = {
+                    name: parameter.detach().clone()
+                    for name, parameter in attention_parameters.items()
+                }
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+                logits = model(input_ids)["logits"]
+                loss = F.cross_entropy(
+                    logits.reshape(-1, config.vocab_size), labels.reshape(-1)
+                )
+                self.assertTrue(torch.isfinite(loss))
+                loss.backward()
+                for name, parameter in attention_parameters.items():
+                    self.assertIsNotNone(parameter.grad, name)
+                    self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+
+                optimizer.step()
+                self.assertTrue(
+                    any(
+                        not torch.equal(before[name], parameter.detach())
+                        for name, parameter in attention_parameters.items()
+                    )
+                )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_ordinary_complex_flash_takes_bfloat16_optimizer_step(self):
@@ -507,7 +705,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         self.assertIsNone(captured["prepared_key_padding_mask"])
         self.assertIs(captured["block_mask"], block_mask)
 
-    def test_padding_metadata_is_prepared_once_for_reusable_backends(self):
+    def test_padding_metadata_is_prepared_once_for_flash_backends(self):
         key_padding_mask = torch.tensor([[False, False, True, True]])
         sentinel = object()
         with mock.patch(
@@ -516,24 +714,60 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         ) as prepare:
             actual = model_module._prepare_backend_padding_metadata(
                 key_padding_mask,
-                ["complex", "split", "dual"],
-                ["flash", "xformers", "flash"],
+                ["real", "complex", "split", "dual"],
+                ["flash", "flash", "flex", "flex"],
             )
 
         self.assertIs(actual, sentinel)
         prepare.assert_called_once_with(key_padding_mask)
 
-    def test_dual_streaming_attention_does_not_prepare_fused_padding_metadata(self):
+    def test_split_and_dual_flex_do_not_prepare_flash_padding_metadata(self):
         key_padding_mask = torch.tensor([[False, False, True, True]])
         with mock.patch("complex_attention.prepare_key_padding_mask") as prepare:
             actual = model_module._prepare_backend_padding_metadata(
                 key_padding_mask,
-                ["dual"],
-                ["flash"],
+                ["split", "dual"],
+                ["flex", "flex"],
             )
 
         self.assertIsNone(actual)
         prepare.assert_not_called()
+
+    def test_model_forwards_never_prepare_backend_padding_metadata(self):
+        input_ids = torch.tensor([[1, 2, 0, 0]])
+        pad_mask = input_ids.ne(0)
+        for ngpt, model_type in (
+            (False, NeoBERT),
+            (True, model_module.NormNeoBERT),
+        ):
+            with self.subTest(ngpt=ngpt):
+                config = NeoBERTConfig(
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=16,
+                    hidden_act="gelu",
+                    vocab_size=32,
+                    max_length=8,
+                    rope=False,
+                    ngpt=ngpt,
+                    attention_spaces=["real"],
+                    attention_backends=["flash"],
+                )
+                model = model_type(config)
+                layer = RecordingLayer()
+                model.transformer_encoder = nn.ModuleList([layer])
+
+                with mock.patch.object(
+                    model_module,
+                    "_prepare_backend_padding_metadata",
+                    side_effect=AssertionError("padding metadata was prepared"),
+                ) as prepare:
+                    output = model(input_ids, pad_mask=pad_mask)
+
+                self.assertEqual(output.shape, (1, 4, 8))
+                prepare.assert_not_called()
+                self.assertIsNone(layer.arguments[3])
 
     def test_rope_preserves_float64_precision(self):
         query = torch.randn(2, 5, 3, 8, dtype=torch.float64)
@@ -603,6 +837,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         def fake_attention(query, key, value, **kwargs):
             captured["query_dtype"] = query[0][0].dtype
             captured["compute_dtype"] = kwargs.get("compute_dtype")
+            captured["keyword_names"] = set(kwargs)
             return value, None
 
         attention._dual_attention = fake_attention
@@ -617,6 +852,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         self.assertEqual(output.shape, (2, 4, 8))
         self.assertEqual(captured["query_dtype"], torch.bfloat16)
         self.assertIsNone(captured["compute_dtype"])
+        self.assertNotIn("tangent_mask_mod", captured["keyword_names"])
 
     def test_padding_bias_stays_compact(self):
         pad_mask = torch.tensor(
@@ -664,14 +900,13 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             "torch.nn.attention.flex_attention.create_block_mask",
             return_value=object(),
         ) as create_mask:
-            _, tangent_mask_mod = model_module._prepare_document_masks(
+            block_mask = model_module._prepare_document_masks(
                 document_ids,
-                include_tangent_mask_mod=True,
                 padding_only=True,
             )
 
         mask_mod = create_mask.call_args.args[0]
-        self.assertIs(tangent_mask_mod, mask_mod)
+        self.assertIsNotNone(block_mask)
         self.assertTrue(bool(mask_mod(0, 0, 3, 0)))
         self.assertFalse(bool(mask_mod(0, 0, 3, 3)))
 
@@ -703,7 +938,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             max_length=8,
             rope=False,
             attention_spaces=["complex", "split"],
-            attention_backends=["flex", "torch"],
+            attention_backends=["torch", "flex"],
         )
         model = NeoBERT(config)
         layers = nn.ModuleList([RecordingLayer(), RecordingLayer()])
@@ -715,7 +950,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         with mock.patch.object(
             model_module,
             "_prepare_document_masks",
-            return_value=(block_mask, None),
+            return_value=block_mask,
         ) as prepare_masks:
             output = model(input_ids, document_ids=document_ids)
 
@@ -723,7 +958,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         self.assertIs(prepare_masks.call_args.args[0], document_ids)
         expected_dense_mask = model_module._prepare_dense_document_mask(document_ids)
         for layer in layers:
-            dense_mask, key_padding_mask, actual_block_mask, _, prepared = layer.arguments
+            dense_mask, key_padding_mask, actual_block_mask, prepared = layer.arguments
             torch.testing.assert_close(dense_mask, expected_dense_mask)
             self.assertIsNone(key_padding_mask)
             self.assertIs(actual_block_mask, block_mask)
@@ -773,14 +1008,13 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         with mock.patch.object(
             model_module,
             "_prepare_document_masks",
-            return_value=(block_mask, None),
+            return_value=block_mask,
         ) as prepare_masks:
             output = model(input_ids, pad_mask=pad_mask)
 
         self.assertEqual(output.shape, (2, 4, 8))
         flex_document_ids = prepare_masks.call_args.args[0]
         self.assertTrue(prepare_masks.call_args.kwargs["padding_only"])
-        self.assertFalse(prepare_masks.call_args.kwargs["include_tangent_mask_mod"])
         expected_document_ids = torch.where(
             pad_mask,
             torch.zeros_like(pad_mask, dtype=torch.int32),
@@ -788,7 +1022,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         )
         torch.testing.assert_close(flex_document_ids, expected_document_ids)
         for layer in layers:
-            dense_mask, key_padding_mask, actual_block_mask, _, prepared = layer.arguments
+            dense_mask, key_padding_mask, actual_block_mask, prepared = layer.arguments
             self.assertEqual(dense_mask.shape, (2, 1, 1, 4))
             torch.testing.assert_close(key_padding_mask, pad_mask.logical_not())
             self.assertIs(actual_block_mask, block_mask)
@@ -827,7 +1061,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             self.assertIs(attention.block_mask, expected_block)
             self.assertIs(attention.attn_mask, expected_mask)
 
-    def test_dual_flex_receives_exact_tangent_mask_callback(self):
+    def test_dual_flex_receives_block_mask_without_parallel_callback(self):
         config = NeoBERTConfig(
             hidden_size=8,
             num_hidden_layers=1,
@@ -845,20 +1079,15 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         layer.complex_attention = attention
         block_mask = object()
 
-        def tangent_mask_mod(batch, head, query_index, key_index):
-            return query_index == key_index
-
         layer._att_block(
             torch.randn(2, 4, 8),
             pad_mask=None,
             freqs_cis=None,
             key_padding_mask=None,
             block_mask=block_mask,
-            dual_tangent_mask_mod=tangent_mask_mod,
         )
 
         self.assertIs(attention.block_mask, block_mask)
-        self.assertIs(attention.tangent_mask_mod, tangent_mask_mod)
 
     def test_adapter_does_not_silently_drop_flash_masks(self):
         config = NeoBERTConfig(

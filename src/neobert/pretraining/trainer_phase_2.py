@@ -184,7 +184,7 @@ def trainer(cfg: DictConfig):
             metrics[f"train/epochs_dataset_{i}"] += 1
             batch = next(iterators[i])
 
-        # Convert Hugging Face multiplicative mask to xformers additive mask
+        # Convert the Hugging Face multiplicative mask to an additive mask.
         pad_mask = torch.where(batch["attention_mask"] == 1, float(0.0), float("-inf")).type(dtype_pad_mask)
 
         # Under the no_sync context manager, PyTorch will skip synchronizing the gradients when .backward() is

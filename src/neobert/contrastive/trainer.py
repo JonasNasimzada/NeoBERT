@@ -235,7 +235,7 @@ def trainer(cfg: DictConfig):
             dataloader = dataloaders[task_name]
             batch = next(iter(dataloader))
 
-            # Convert Hugging Face multiplicative mask to xformers additive mask
+            # Convert the Hugging Face multiplicative mask to an additive mask.
             pad_mask_queries = torch.where(batch["attention_mask_queries"] == 1, float(0.0), float("-inf")).type(dtype_pad_mask)
             pad_mask_corpus = torch.where(batch["attention_mask_corpus"] == 1, float(0.0), float("-inf")).type(dtype_pad_mask)
             if "input_ids_negative" in batch.keys():
@@ -252,7 +252,7 @@ def trainer(cfg: DictConfig):
             batch["input_ids_queries"] = batch["input_ids"]
             batch["input_ids_corpus"] = batch["input_ids"]
 
-            # Convert Hugging Face multiplicative mask to xformers additive mask
+            # Convert the Hugging Face multiplicative mask to an additive mask.
             pad_mask_queries = torch.where(batch["attention_mask"] == 1, float(0.0), float("-inf")).type(dtype_pad_mask)
             pad_mask_corpus = pad_mask_queries
 

@@ -7,6 +7,7 @@ rms_norm: true
 embedding_rms_norm: true
 hidden_act: swiglu
 dropout: 0
+attention_dropout: 0
 norm_eps: 1e-05
 embedding_init_range: 0.02
 decoder_init_range: 0.02
@@ -63,16 +64,14 @@ attention_backends:
   - flex
   - flex
   - flex
-  # Split-complex reconstruction must stay widened until its final cast.
-  # These layers therefore use the widened torch path with one shared dense
-  # packed-document keep-mask rather than narrow FlexAttention outputs.
-  - torch
-  - torch
-  - torch
-  - torch
-  - torch
-  - torch
-  - torch
-  - torch
-  - torch
+  # 9 split-complex layers use the same packed-document BlockMask.
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
+  - flex
 dual_tangent_chunk_size: 128

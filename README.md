@@ -15,11 +15,20 @@ Ensure you have the following dependencies installed:
 pip install transformers torch xformers==0.0.28.post3
 ```
 
-If you would like to use sequence packing (un-padding), you will need to also install flash-attention:
+xFormers integration is limited to the fused SwiGLU implementation; it is not
+an attention backend. Sequence packing uses the FlexAttention API included in
+PyTorch. Attention backends are selected per scalar space:
 
-```bash
-pip install transformers torch xformers==0.0.28.post3 flash_attn
-```
+| Scalar space | Supported backends |
+| --- | --- |
+| Real | `auto`, `torch`, `flash`, `flex` |
+| Ordinary complex | `auto`, `native`, `torch`, `flash`, `flex` |
+| Split complex | `auto`, `native`, `torch`, `flex` |
+| Dual complex | `auto`, `native`, `torch`, `flex` |
+
+The legacy `flash_attention` flag maps `true` to `flash` and `false` to
+`torch`. Packed-document schedules should use `flex`; direct `flash` does not
+support arbitrary document masks.
 
 ## How to use
 
