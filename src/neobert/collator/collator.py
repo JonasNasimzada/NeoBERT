@@ -133,7 +133,20 @@ def get_collator(
 
         def collate_fn(batch):
             batch = mlm_collator(batch)
-            batch["attention_mask"] = torch.where(batch["attention_mask"] == 1, float(0.0), float("-inf")).type(dtype)
+            attention_mask = batch["attention_mask"]
+            if bool(attention_mask.all()):
+                # An all-zero additive mask is numerically a no-op, but the
+                # model's public mask API must interpret an all-zero floating
+                # tensor as a binary mask for backward compatibility.  Omit
+                # the no-op instead of turning a fully valid batch into a
+                # fully masked one.
+                batch.pop("attention_mask")
+            else:
+                batch["attention_mask"] = torch.where(
+                    attention_mask == 1,
+                    float(0.0),
+                    float("-inf"),
+                ).type(dtype)
             return batch
 
     return collate_fn

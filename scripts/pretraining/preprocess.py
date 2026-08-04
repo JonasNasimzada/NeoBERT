@@ -1,5 +1,12 @@
+import json
+import os
+import shutil
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from datasets import Dataset, Features, Sequence, Value, concatenate_datasets, load_dataset
 
@@ -29,10 +36,16 @@ def select_approx_token_limit(dataset, token_limit):
 def pack_tokenized_dataset(
     dataset,
     sequence_length,
-    pad_token_id,
-    bos_token_id,
-    eos_token_id,
+    cache_dir=None,
 ):
+    """Concatenate tokenized segments into full rows without padding.
+
+    Each input row already contains the tokenizer's BOS/EOS tokens. A segment
+    may straddle two packed rows, but its tokens retain the same document id
+    within each row. The model uses those ids to prevent cross-document
+    attention. The single incomplete tail is discarded so every saved token is
+    a real training token, matching the paper's padding-free packing recipe.
+    """
     features = Features(
         {
             "input_ids": Sequence(Value("int32")),
@@ -46,31 +59,13 @@ def pack_tokenized_dataset(
         segment_id = 0
         for row in dataset:
             input_ids = list(row["input_ids"])
-            if input_ids and input_ids[0] == bos_token_id:
-                input_ids = input_ids[1:]
-            if input_ids and input_ids[-1] == eos_token_id:
-                input_ids = input_ids[:-1]
             offset = 0
             while offset < len(input_ids):
                 remaining = sequence_length - len(current_tokens)
-                if remaining < 3:
-                    current_tokens.extend([pad_token_id] * remaining)
-                    current_document_ids.extend([-1] * remaining)
-                    yield {
-                        "input_ids": current_tokens,
-                        "document_ids": current_document_ids,
-                    }
-                    current_tokens = []
-                    current_document_ids = []
-                    remaining = sequence_length
-
-                take = min(remaining - 2, len(input_ids) - offset)
-                current_tokens.append(bos_token_id)
+                take = min(remaining, len(input_ids) - offset)
                 current_tokens.extend(input_ids[offset : offset + take])
-                current_tokens.append(eos_token_id)
-                current_document_ids.extend([segment_id] * (take + 2))
+                current_document_ids.extend([segment_id] * take)
                 offset += take
-                segment_id += 1
                 if len(current_tokens) == sequence_length:
                     yield {
                         "input_ids": current_tokens,
@@ -78,16 +73,97 @@ def pack_tokenized_dataset(
                     }
                     current_tokens = []
                     current_document_ids = []
+            segment_id += 1
 
         if current_tokens:
-            padding = sequence_length - len(current_tokens)
-            yield {
-                "input_ids": current_tokens + [pad_token_id] * padding,
-                "document_ids": current_document_ids + [-1] * padding,
-            }
+            print(
+                f"Dropping the final {len(current_tokens):,}-token partial row "
+                "to keep the packed dataset padding-free"
+            )
 
     print(f"Packing tokenized documents into fixed rows of {sequence_length:,} tokens")
-    return Dataset.from_generator(packed_rows, features=features)
+    return Dataset.from_generator(
+        packed_rows,
+        features=features,
+        cache_dir=cache_dir,
+    )
+
+
+def save_preprocessed_dataset(dataset, tokenizer, cfg):
+    output_path = Path(cfg.dataset.path_to_disk).resolve()
+    if output_path.exists():
+        raise FileExistsError(
+            f"Refusing to overwrite prepared dataset: {output_path}. "
+            "Choose a new dataset.path_to_disk or move the existing directory."
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_path.name}.tmp-",
+            dir=output_path.parent,
+        )
+    )
+
+    configured_sequence_length = cfg.dataset.get("pack_to_length")
+    sequence_length = (
+        int(configured_sequence_length)
+        if configured_sequence_length is not None
+        else None
+    )
+    configured_token_limit = cfg.dataset.get("approx_token_limit")
+    manifest = {
+        "format_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": OmegaConf.to_container(cfg.dataset.train, resolve=True),
+        "source_token_limit": (
+            int(configured_token_limit)
+            if configured_token_limit is not None
+            else None
+        ),
+        "dataset_fingerprint": dataset._fingerprint,
+        "rows": len(dataset),
+        "sequence_length": sequence_length,
+        "packed_token_positions": (
+            len(dataset) * sequence_length
+            if sequence_length is not None
+            else None
+        ),
+        "packing": {
+            "padding_free": sequence_length is not None,
+            "cross_document_attention": (
+                False if sequence_length is not None else None
+            ),
+            "document_id_padding_value": None,
+        },
+        "tokenizer": {
+            "name": cfg.tokenizer.pretrained_model_name_or_path,
+            "revision": cfg.tokenizer.get("revision"),
+            "vocab_size": len(tokenizer),
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id,
+            "mask_token_id": tokenizer.mask_token_id,
+        },
+    }
+    if cfg.dataset.name == "fineweb_edu":
+        manifest["paper_schedule"] = {
+            "optimizer_steps": 620,
+            "global_sequences": 2048,
+            "required_token_positions": 620 * 2048 * 1024,
+        }
+
+    try:
+        print(f"Saving tokenized dataset atomically to {output_path}")
+        dataset.save_to_disk(str(temporary_path), max_shard_size="1GB")
+        tokenizer.save_pretrained(temporary_path / "tokenizer")
+        (temporary_path / "optibertneo_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.rename(temporary_path, output_path)
+    except BaseException:
+        shutil.rmtree(temporary_path, ignore_errors=True)
+        raise
 
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="pretraining")
@@ -119,9 +195,6 @@ def preprocess(cfg: DictConfig):
         dataset = pack_tokenized_dataset(
             dataset,
             cfg.dataset.pack_to_length,
-            tokenizer.pad_token_id,
-            tokenizer.bos_token_id,
-            tokenizer.eos_token_id,
         )
     minimum_packed_rows = cfg.dataset.get("minimum_packed_rows")
     if minimum_packed_rows is not None and len(dataset) < minimum_packed_rows:
@@ -130,9 +203,7 @@ def preprocess(cfg: DictConfig):
         )
     print(f"Prepared {len(dataset):,} training rows")
 
-    # Save the tokenized dataset to disk
-    print("Saving tokenized dataset")
-    dataset.save_to_disk(cfg.dataset.path_to_disk, max_shard_size="1GB")
+    save_preprocessed_dataset(dataset, tokenizer, cfg)
 
 
 if __name__ == "__main__":

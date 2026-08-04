@@ -1,6 +1,8 @@
+import json
 import os
 import shutil
 import re
+from pathlib import Path
 from tqdm import tqdm
 
 from omegaconf import OmegaConf, DictConfig
@@ -64,16 +66,208 @@ def count_batch_tokens(batch: BatchEncoding) -> int:
     return batch["input_ids"].numel()
 
 
+def validate_prepacked_dataset(dataset, tokenizer, cfg, world_size):
+    required_columns = {"input_ids", "document_ids"}
+    missing_columns = required_columns.difference(dataset.column_names)
+    if missing_columns:
+        raise ValueError(
+            "prepacked dataset is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    sequence_length = int(cfg.tokenizer.max_length)
+    required_rows = (
+        int(cfg.trainer.max_steps)
+        * int(cfg.dataloader.train.batch_size)
+        * int(cfg.trainer.gradient_accumulation_steps)
+        * int(world_size)
+    )
+    if len(dataset) < required_rows:
+        raise ValueError(
+            f"prepared dataset has {len(dataset):,} rows, but this run needs "
+            f"at least {required_rows:,} rows to avoid repeating data"
+        )
+
+    for index in {0, len(dataset) - 1}:
+        row = dataset[index]
+        if len(row["input_ids"]) != sequence_length:
+            raise ValueError(
+                f"dataset row {index} has {len(row['input_ids'])} tokens; "
+                f"expected {sequence_length}"
+            )
+        if len(row["document_ids"]) != sequence_length:
+            raise ValueError(
+                f"dataset row {index} has {len(row['document_ids'])} document ids; "
+                f"expected {sequence_length}"
+            )
+        if any(document_id < 0 for document_id in row["document_ids"]):
+            raise ValueError(
+                f"dataset row {index} contains padding document ids; "
+                "the OptiBERTneo paper recipe is padding-free"
+            )
+
+    manifest_path = Path(cfg.dataset.path_to_disk) / "optibertneo_manifest.json"
+    if not manifest_path.is_file():
+        if cfg.dataset.get("require_manifest", False):
+            raise ValueError(
+                f"dataset manifest is missing: {manifest_path}. "
+                "Re-run scripts/pretraining/preprocess.py with the OptiBERTneo setup."
+            )
+        return
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_positions = len(dataset) * sequence_length
+    if manifest.get("rows") != len(dataset):
+        raise ValueError("dataset manifest row count does not match the Arrow dataset")
+    if manifest.get("sequence_length") != sequence_length:
+        raise ValueError("dataset manifest sequence length does not match the run")
+    if manifest.get("packed_token_positions") != expected_positions:
+        raise ValueError("dataset manifest token count does not match the Arrow dataset")
+    if not manifest.get("packing", {}).get("padding_free", False):
+        raise ValueError("dataset manifest does not declare padding-free packing")
+    tokenizer_manifest = manifest.get("tokenizer", {})
+    expected_tokenizer_values = {
+        "vocab_size": len(tokenizer),
+        "bos_token_id": tokenizer.bos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+        "pad_token_id": tokenizer.pad_token_id,
+        "mask_token_id": tokenizer.mask_token_id,
+    }
+    for name, expected in expected_tokenizer_values.items():
+        if tokenizer_manifest.get(name) != expected:
+            raise ValueError(
+                f"dataset tokenizer {name}={tokenizer_manifest.get(name)!r} "
+                f"does not match the training tokenizer value {expected!r}"
+            )
+
+
+def _state_dict_without_compile_prefix(state_dict):
+    prefix = "_orig_mod."
+    while state_dict and all(key.startswith(prefix) for key in state_dict):
+        state_dict = {
+            key[len(prefix) :]: value
+            for key, value in state_dict.items()
+        }
+    return state_dict
+
+
+def _model_without_compile_wrapper(accelerator, model):
+    model = accelerator.unwrap_model(model)
+    while hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    return model
+
+
+def discover_resume_checkpoint(checkpoint_directory):
+    """Return the latest complete Accelerate checkpoint and next save index."""
+    checkpoint_directory = Path(checkpoint_directory)
+    indexed_checkpoints = []
+    if checkpoint_directory.is_dir():
+        for path in checkpoint_directory.iterdir():
+            match = re.fullmatch(r"checkpoint_(\d+)", path.name)
+            if path.is_dir() and match is not None:
+                indexed_checkpoints.append((int(match.group(1)), path))
+
+    next_iteration = (
+        max(index for index, _ in indexed_checkpoints) + 1
+        if indexed_checkpoints
+        else 0
+    )
+    complete_checkpoints = [
+        (index, path)
+        for index, path in indexed_checkpoints
+        if (path / "_SUCCESS").is_file()
+    ]
+    latest_complete = (
+        max(complete_checkpoints, key=lambda item: item[0])[1]
+        if complete_checkpoints
+        else None
+    )
+    return latest_complete, next_iteration
+
+
+def save_accelerator_checkpoint(accelerator):
+    """Save a resumable state and mark it complete only after every rank exits."""
+    checkpoint_path = (
+        Path(accelerator.project_dir)
+        / "checkpoints"
+        / f"checkpoint_{accelerator.save_iteration}"
+    )
+    accelerator.save_state()
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        (checkpoint_path / "_SUCCESS").write_text("complete\n", encoding="utf-8")
+    accelerator.wait_for_everyone()
+
+
+def save_model_checkpoint(accelerator, model, directory, step):
+    checkpoint_path = Path(directory) / str(step)
+    accelerator.wait_for_everyone()
+    if accelerator.distributed_type is DistributedType.DEEPSPEED:
+        model.save_checkpoint(str(directory), tag=str(step))
+    elif accelerator.is_main_process:
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        state_dict = _state_dict_without_compile_prefix(
+            accelerator.get_state_dict(model)
+        )
+        temporary_path = checkpoint_path / "state_dict.pt.tmp"
+        torch.save(state_dict, temporary_path)
+        os.replace(temporary_path, checkpoint_path / "state_dict.pt")
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        (checkpoint_path / "_SUCCESS").write_text("complete\n", encoding="utf-8")
+    accelerator.wait_for_everyone()
+
+
+def export_pretrained_model(accelerator, model, tokenizer, cfg, metrics):
+    export_path = Path(cfg.trainer.dir) / "final_model"
+    accelerator.wait_for_everyone()
+    state_dict = accelerator.get_state_dict(model)
+    state_dict = _state_dict_without_compile_prefix(state_dict)
+    if accelerator.is_main_process:
+        model_to_save = _model_without_compile_wrapper(accelerator, model)
+        model_to_save.save_pretrained(
+            export_path,
+            state_dict=state_dict,
+            safe_serialization=True,
+        )
+        tokenizer.save_pretrained(export_path)
+        (export_path / "training_summary.json").write_text(
+            json.dumps(
+                {
+                    "optimizer_steps": int(metrics["train/steps"]),
+                    "training_sequences": int(metrics["train/samples"]),
+                    "training_tokens": int(metrics["train/tokens"]),
+                    "masked_tokens": int(metrics["train/masked_tokens"]),
+                    "resolved_config": OmegaConf.to_container(cfg, resolve=True),
+                },
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    accelerator.wait_for_everyone()
+
+
 def trainer(cfg: DictConfig):
-    # Get the last checkpoint id
+    # Get the last complete checkpoint and choose an unused save index. An
+    # interrupted checkpoint remains on disk for diagnosis but is never loaded.
     checkpoint_dir = os.path.join(cfg.trainer.dir, "checkpoints")
     model_checkpoint_dir = os.path.join(cfg.trainer.dir, "model_checkpoints")
     os.makedirs(model_checkpoint_dir, exist_ok=True)
-    iteration = 0
-    if cfg.trainer.resume and os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
-        # This regular expression was taken from accelerator.load_state()
-        folders = os.listdir(checkpoint_dir)
-        iteration = max(int(re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)[0]) for folder in folders) + 1
+    resume_checkpoint, iteration = discover_resume_checkpoint(checkpoint_dir)
+    if (
+        cfg.trainer.resume
+        and os.path.isdir(checkpoint_dir)
+        and any(Path(checkpoint_dir).iterdir())
+        and resume_checkpoint is None
+    ):
+        raise RuntimeError(
+            f"{checkpoint_dir} contains no completed checkpoint. "
+            "Keep it for diagnosis and select a fresh RUN_ROOT."
+        )
 
     # Accelerator object
     project_config = ProjectConfiguration(
@@ -82,7 +276,12 @@ def trainer(cfg: DictConfig):
         total_limit=cfg.trainer.accelerate.max_ckpt,
         iteration=iteration,
     )
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=cfg.trainer.get(
+            "find_unused_parameters",
+            True,
+        )
+    )
     accelerator = Accelerator(
         step_scheduler_with_optimizer=False,  # enable manual control of the scheduler
         mixed_precision=cfg.trainer.mixed_precision,
@@ -132,6 +331,13 @@ def trainer(cfg: DictConfig):
 
     # Dataset
     train_dataset = load_from_disk(cfg.dataset.path_to_disk)
+    if cfg.dataloader.train.get("prepacked_sequences", False):
+        validate_prepacked_dataset(
+            train_dataset,
+            tokenizer,
+            cfg,
+            accelerator.num_processes,
+        )
 
     # Dataloader
     train_dataloader = get_dataloader(train_dataset, tokenizer, dtype=dtype_pad_mask, **cfg.dataloader.train, **cfg.datacollator)
@@ -172,8 +378,8 @@ def trainer(cfg: DictConfig):
 
     # Resume from the latest checkpoint
     skipped_train_dataloader = None
-    if cfg.trainer.resume and os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
-        accelerator.load_state()
+    if cfg.trainer.resume and resume_checkpoint is not None:
+        accelerator.load_state(str(resume_checkpoint))
         train_dataloader.set_epoch(metrics["train/epochs"])
         skipped_train_dataloader = accelerator.skip_first_batches(train_dataloader, metrics["train/batches"] % len(train_dataloader))
 
@@ -273,11 +479,14 @@ def trainer(cfg: DictConfig):
 
                 # Save the accelerator state from the main process
                 if metrics["train/steps"] % cfg.trainer.accelerate.save_steps == 0:
-                    accelerator.save_state()
+                    save_accelerator_checkpoint(accelerator)
 
                 # Save the pytorch model
                 if metrics["train/steps"] % cfg.trainer.model.save_steps == 0:
-                    if cfg.trainer.model.max_ckpt is not None:
+                    if (
+                        cfg.trainer.model.max_ckpt is not None
+                        and accelerator.is_main_process
+                    ):
                         # Delete checkpoints if there are too many
                         files = os.listdir(model_checkpoint_dir)
                         iterations = [int(f) for f in files if f.isdigit()]
@@ -290,16 +499,13 @@ def trainer(cfg: DictConfig):
                             print(
                                  f"Deleted old model checkpoint {file_to_remove} due to limit " f"(max_ckpt = {cfg.trainer.model.max_ckpt})"
                             )
-                    # Save the checkpoint
-                    if accelerator.distributed_type is DistributedType.DEEPSPEED:
-                        model.save_checkpoint(model_checkpoint_dir, tag=metrics["train/steps"])
-                    else:
-                        path = os.path.join(model_checkpoint_dir, str(metrics["train/steps"]))
-                        os.makedirs(path, exist_ok=True)
-                        torch.save(
-                            model.state_dict(),
-                            os.path.join(path, "state_dict.pt"),
-                        )
+                    accelerator.wait_for_everyone()
+                    save_model_checkpoint(
+                        accelerator,
+                        model,
+                        model_checkpoint_dir,
+                        metrics["train/steps"],
+                    )
 
                 if metrics["train/steps"] >= cfg.trainer.max_steps:
                     break
@@ -321,13 +527,22 @@ def trainer(cfg: DictConfig):
         cfg.trainer.model.get("save_at_end", False)
         and metrics["train/steps"] % cfg.trainer.model.save_steps != 0
     ):
-        accelerator.save_state()
-        if accelerator.distributed_type is DistributedType.DEEPSPEED:
-            model.save_checkpoint(model_checkpoint_dir, tag=metrics["train/steps"])
-        elif accelerator.is_main_process:
-            path = os.path.join(model_checkpoint_dir, str(metrics["train/steps"]))
-            os.makedirs(path, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(path, "state_dict.pt"))
+        save_accelerator_checkpoint(accelerator)
+        save_model_checkpoint(
+            accelerator,
+            model,
+            model_checkpoint_dir,
+            metrics["train/steps"],
+        )
+
+    if cfg.trainer.model.get("export_at_end", False):
+        export_pretrained_model(
+            accelerator,
+            model,
+            tokenizer,
+            cfg,
+            metrics,
+        )
 
     # Make sure that the wandb tracker finishes correctly and close the progress bar
     pbar.close()

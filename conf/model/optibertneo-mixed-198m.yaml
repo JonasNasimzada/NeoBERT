@@ -64,7 +64,7 @@ attention_backends:
   - flex
   - flex
   # Split-complex reconstruction must stay widened until its final cast.
-  # These layers therefore use the exact torch path with one shared dense
+  # These layers therefore use the widened torch path with one shared dense
   # packed-document keep-mask rather than narrow FlexAttention outputs.
   - torch
   - torch

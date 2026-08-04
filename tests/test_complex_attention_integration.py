@@ -6,9 +6,10 @@ from unittest import mock
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 import neobert.model.model as model_module
-from neobert.model import NeoBERT, NeoBERTConfig
+from neobert.model import NeoBERT, NeoBERTConfig, NeoBERTLMHead
 from neobert.model.rotary import apply_rotary_emb, precompute_freqs_cis
 
 
@@ -65,7 +66,7 @@ class RecordingAttention(nn.Module):
 
 
 class TestComplexAttentionIntegration(unittest.TestCase):
-    def test_shipped_mixed_config_uses_exact_split_backend(self):
+    def test_shipped_mixed_config_uses_widened_split_backend(self):
         config_path = (
             Path(__file__).resolve().parents[1]
             / "conf"
@@ -181,6 +182,26 @@ class TestComplexAttentionIntegration(unittest.TestCase):
                 seq_len=2,
             )
 
+    @unittest.skipUnless(hasattr(torch, "compile"), "torch.compile is unavailable")
+    def test_floating_padding_mask_compiles_without_graph_breaks(self):
+        additive_mask = torch.tensor(
+            [[0.0, 0.0, float("-inf"), float("-inf")]],
+            dtype=torch.bfloat16,
+        )
+
+        def prepare(mask):
+            return model_module._prepare_attention_masks(
+                mask,
+                num_heads=2,
+                seq_len=4,
+            )
+
+        compiled = torch.compile(prepare, backend="eager", fullgraph=True)
+        actual_bias, actual_padding = compiled(additive_mask)
+        expected_bias, expected_padding = prepare(additive_mask)
+        torch.testing.assert_close(actual_bias, expected_bias)
+        torch.testing.assert_close(actual_padding, expected_padding)
+
     def test_legacy_flash_flag_maps_to_historical_backend(self):
         xformers_config = NeoBERTConfig(flash_attention=True)
         torch_config = NeoBERTConfig(flash_attention=False)
@@ -191,6 +212,155 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         self.assertTrue(all(value == "xformers" for value in xformers_config.attention_backends))
         self.assertTrue(all(value == "torch" for value in torch_config.attention_backends))
         self.assertTrue(all(value == "torch" for value in modern_config.attention_backends))
+
+    def test_ordinary_complex_native_backend_is_accepted(self):
+        config = NeoBERTConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            hidden_act="gelu",
+            vocab_size=32,
+            max_length=8,
+            rope=False,
+            attention_space="complex",
+            attention_backend="native",
+        )
+        self.assertEqual(config.attention_spaces, ["complex"])
+        self.assertEqual(config.attention_backends, ["native"])
+
+    def test_supported_homogeneous_models_take_optimizer_steps(self):
+        input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        labels = torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]])
+        combinations = (
+            ("complex", "native"),
+            ("complex", "torch"),
+            ("split", "native"),
+            ("split", "torch"),
+            ("dual", "native"),
+            ("dual", "torch"),
+        )
+
+        for use_autocast in (False, True):
+            for space, backend in combinations:
+                with self.subTest(
+                    space=space,
+                    backend=backend,
+                    autocast=use_autocast,
+                ):
+                    torch.manual_seed(1234)
+                    config = NeoBERTConfig(
+                        hidden_size=8,
+                        num_hidden_layers=1,
+                        num_attention_heads=2,
+                        intermediate_size=16,
+                        hidden_act="gelu",
+                        vocab_size=19,
+                        max_length=4,
+                        rope=False,
+                        dropout=0.0,
+                        attention_space=space,
+                        attention_backend=backend,
+                    )
+                    model = NeoBERTLMHead(config).train()
+                    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+                    attention = model.model.transformer_encoder[0].complex_attention
+                    before = {
+                        name: parameter.detach().clone()
+                        for name, parameter in attention.named_parameters()
+                    }
+
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autocast(
+                        "cpu",
+                        dtype=torch.bfloat16,
+                        enabled=use_autocast,
+                    ):
+                        logits = model(input_ids)["logits"]
+                        loss = F.cross_entropy(
+                            logits.float().reshape(-1, config.vocab_size),
+                            labels.reshape(-1),
+                        )
+                    self.assertTrue(torch.isfinite(loss))
+                    loss.backward()
+
+                    for name, parameter in attention.named_parameters():
+                        self.assertIsNotNone(parameter.grad, name)
+                        self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                        self.assertGreater(parameter.grad.count_nonzero().item(), 0, name)
+
+                    optimizer.step()
+                    self.assertTrue(
+                        any(
+                            not torch.equal(before[name], parameter.detach())
+                            for name, parameter in attention.named_parameters()
+                        )
+                    )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_ordinary_complex_flash_takes_bfloat16_optimizer_step(self):
+        flash_available = getattr(
+            torch.backends.cuda,
+            "is_flash_attention_available",
+            lambda: True,
+        )
+        if not flash_available():
+            self.skipTest("this PyTorch build has no Flash SDPA")
+
+        torch.manual_seed(1234)
+        config = NeoBERTConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            hidden_act="gelu",
+            vocab_size=19,
+            max_length=4,
+            rope=False,
+            dropout=0.0,
+            attention_space="complex",
+            attention_backend="flash",
+        )
+        model = NeoBERTLMHead(config).cuda().train()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+        input_ids = torch.tensor(
+            [[1, 2, 3, 4], [5, 6, 7, 8]],
+            device="cuda",
+        )
+        labels = torch.tensor(
+            [[2, 3, 4, 5], [6, 7, 8, 9]],
+            device="cuda",
+        )
+        attention = model.model.transformer_encoder[0].complex_attention
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in attention.named_parameters()
+        }
+
+        optimizer.zero_grad(set_to_none=True)
+        autocast_dtype = (
+            torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        )
+        with torch.autocast("cuda", dtype=autocast_dtype):
+            logits = model(input_ids)["logits"]
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, config.vocab_size),
+                labels.reshape(-1),
+            )
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        for name, parameter in attention.named_parameters():
+            self.assertIsNotNone(parameter.grad, name)
+            self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+            self.assertGreater(parameter.grad.count_nonzero().item(), 0, name)
+
+        optimizer.step()
+        self.assertTrue(
+            any(
+                not torch.equal(before[name], parameter.detach())
+                for name, parameter in attention.named_parameters()
+            )
+        )
 
     def test_meta_state_assignment_regenerates_nonpersistent_rope(self):
         config = NeoBERTConfig(

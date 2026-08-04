@@ -6,6 +6,7 @@ rope: true
 rms_norm: true
 embedding_rms_norm: true
 hidden_act: swiglu
+fused_swiglu: false
 dropout: 0
 norm_eps: 1e-05
 embedding_init_range: 0.02

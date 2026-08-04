@@ -4,7 +4,9 @@ path_to_disk: tokenized_datasets/fineweb_edu_roberta_1p6b
 approx_token_limit: 1600000000
 pack_to_length: 1024
 minimum_packed_rows: 1269760
+require_manifest: true
 train:
   path: HuggingFaceFW/fineweb-edu
   name: sample-10BT
   split: train
+  revision: v1.0.0

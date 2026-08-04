@@ -7,6 +7,7 @@ gradient_accumulation_steps: 1
 gradient_clipping: 1
 compile: true
 compile_fullgraph: false
+find_unused_parameters: false
 accelerate:
   save_steps: 100
   max_ckpt: 3
@@ -14,4 +15,5 @@ model:
   save_steps: 100
   max_ckpt: 7
   save_at_end: true
+  export_at_end: true
 dir: logs/checkpoints

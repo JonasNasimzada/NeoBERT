@@ -7,6 +7,7 @@ import numpy as np
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
@@ -30,6 +31,32 @@ from .rmsnorm import RMSNorm
 from .rotary import precompute_freqs_cis, apply_rotary_emb
 
 
+def _is_compiling():
+    compiler = getattr(torch, "compiler", None)
+    compiler_is_compiling = getattr(compiler, "is_compiling", None)
+    if compiler_is_compiling is not None:
+        return compiler_is_compiling()
+    dynamo = getattr(torch, "_dynamo", None)
+    return dynamo is not None and dynamo.is_compiling()
+
+
+class NativeSwiGLU(nn.Module):
+    """PyTorch SwiGLU with xFormers-compatible parameter names."""
+
+    def __init__(self, in_features, hidden_features, out_features, bias=False):
+        super().__init__()
+        self.w12 = nn.Linear(
+            in_features,
+            2 * hidden_features,
+            bias=bias,
+        )
+        self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
+
+    def forward(self, x):
+        gate, value = self.w12(x).chunk(2, dim=-1)
+        return self.w3(F.silu(gate) * value)
+
+
 def _valid_tokens_from_padding_mask(pad_mask):
     if not isinstance(pad_mask, torch.Tensor):
         raise ValueError("pad_mask must be a tensor")
@@ -43,7 +70,9 @@ def _valid_tokens_from_padding_mask(pad_mask):
         torch.int64,
     )
     if pad_mask.dtype in integer_dtypes:
-        if not bool(((pad_mask == 0) | (pad_mask == 1)).all()):
+        if not _is_compiling() and not bool(
+            ((pad_mask == 0) | (pad_mask == 1)).all()
+        ):
             raise ValueError("integer pad_mask must be binary 0/1")
         return pad_mask > 0
     if not torch.is_floating_point(pad_mask):
@@ -51,7 +80,12 @@ def _valid_tokens_from_padding_mask(pad_mask):
     # A floating mask containing -inf is unambiguously additive. Otherwise it
     # follows the standard 0/1 attention-mask convention, including an all-zero
     # (fully padded) batch. A no-op additive mask should be passed as None.
-    if bool(torch.isneginf(pad_mask).any()):
+    is_additive = torch.isneginf(pad_mask).any()
+    if _is_compiling():
+        # Keep the trainer's additive 0/-inf masks and the public floating
+        # 0/1 masks distinguishable without a Tensor.item() graph break.
+        return torch.where(is_additive, pad_mask == 0, pad_mask > 0)
+    if bool(is_additive):
         if not bool(((pad_mask == 0) | torch.isneginf(pad_mask)).all()):
             raise ValueError(
                 "additive floating pad_mask may contain only 0/-inf"
@@ -243,6 +277,7 @@ class NeoBERTConfig(PretrainedConfig):
         embedding_rms_norm: bool = False,
         tie_word_embeddings: bool = False,
         lm_head_bias: bool = True,
+        fused_swiglu: bool = True,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -306,8 +341,10 @@ class NeoBERTConfig(PretrainedConfig):
         for layer_space, layer_backend in zip(attention_spaces, attention_backends):
             if layer_space == "real" and layer_backend in ("native", "reference"):
                 raise ValueError("real layers support auto, torch, xformers, flash, or flex")
-            if layer_space == "complex" and layer_backend in ("native", "reference"):
-                raise ValueError("ordinary complex layers support auto, torch, xformers, flash, or flex")
+            if layer_space == "complex" and layer_backend == "reference":
+                raise ValueError(
+                    "ordinary complex layers support auto, native, torch, xformers, flash, or flex"
+                )
             if layer_space == "split" and layer_backend in (
                 "reference",
                 "xformers",
@@ -327,6 +364,7 @@ class NeoBERTConfig(PretrainedConfig):
         self.ngpt = ngpt
         self.embedding_rms_norm = embedding_rms_norm
         self.lm_head_bias = lm_head_bias
+        self.fused_swiglu = fused_swiglu
         self.kwargs = kwargs
 
 
@@ -359,15 +397,23 @@ class EncoderBlock(nn.Module):
         # Feedforward network
         match config.hidden_act.lower():
             case "swiglu":
-                if SwiGLU is None:
-                    raise RuntimeError("hidden_act='SwiGLU' requires an installed xFormers package")
                 # To keep the number of parameters and the amount of computation constant, we reduce the number of
                 # hidden units by a factor of 2/3 (https://arxiv.org/pdf/2002.05202.pdf) and make it a multiple of 8 to
                 # avoid RuntimeError due to misaligned operand
                 multiple_of = 8
                 intermediate_size = int(2 * config.intermediate_size / 3)
                 intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
-                self.ffn = SwiGLU(config.hidden_size, intermediate_size, config.hidden_size, bias=False)
+                swiglu_class = (
+                    SwiGLU
+                    if config.fused_swiglu and SwiGLU is not None
+                    else NativeSwiGLU
+                )
+                self.ffn = swiglu_class(
+                    config.hidden_size,
+                    intermediate_size,
+                    config.hidden_size,
+                    bias=False,
+                )
             case "gelu":
                 self.ffn = nn.Sequential(
                     nn.Linear(config.hidden_size, config.intermediate_size, bias=False),
@@ -933,6 +979,7 @@ class NormNeoBERT(NeoBERTPreTrainedModel):
 
 class NeoBERTLMHead(NeoBERTPreTrainedModel):
     config_class = NeoBERTConfig
+    _tied_weights_keys = ["decoder.weight"]
 
     def __init__(self, config: NeoBERTConfig):
         super().__init__(config)
@@ -949,6 +996,18 @@ class NeoBERTLMHead(NeoBERTPreTrainedModel):
         self.post_init()
         if config.tie_word_embeddings:
             self.decoder.weight = self.model.encoder.weight
+
+    def get_input_embeddings(self):
+        return self.model.encoder
+
+    def set_input_embeddings(self, embeddings):
+        self.model.encoder = embeddings
+
+    def get_output_embeddings(self):
+        return self.decoder
+
+    def set_output_embeddings(self, decoder):
+        self.decoder = decoder
 
     def forward(self, src, pad_mask=None, document_ids=None):
         hidden_representation = self.model.forward(src, pad_mask, document_ids)

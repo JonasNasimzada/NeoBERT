@@ -12,6 +12,8 @@ def get_tokenizer(
     vocab_size: int = 32064,
     max_length: int = 4096,
     token: str = None,
+    revision: str = None,
+    trust_remote_code: bool = True,
     **kwargs,
 ):
     # Load Tokenizer and replace/add special tokens
@@ -20,7 +22,8 @@ def get_tokenizer(
         max_length=max_length,
         vocab_size=vocab_size,
         token=token,
-        trust_remote_code=True,
+        revision=revision,
+        trust_remote_code=trust_remote_code,
     )
 
     if pretrained_model_name_or_path != "google-bert/bert-base-uncased":

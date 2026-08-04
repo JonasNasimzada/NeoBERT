@@ -1,7 +1,7 @@
 import math
 from collections import defaultdict
 
-from torch import Tensor
+import torch
 from accelerate import Accelerator
 
 
@@ -19,14 +19,26 @@ class Metrics(defaultdict):
 
     def log(self, accelerator: Accelerator):
         # Aggregate ALL metrics across devices (only required for local counters!)
-        metrics_agg = Tensor(list(self.values())).to(accelerator.device, non_blocking=True)
-        metrics_agg = accelerator.reduce(metrics_agg, reduction="sum").detach().cpu().numpy()
-        metrics_agg = {k: v for k, v in zip(self.keys(), metrics_agg)}
+        metric_keys = tuple(self.keys())
+        metrics_agg = torch.tensor(
+            [self[key] for key in metric_keys],
+            dtype=torch.float64,
+            device=accelerator.device,
+        )
+        metrics_agg = (
+            accelerator.reduce(metrics_agg, reduction="sum")
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        metrics_agg = dict(zip(metric_keys, metrics_agg))
 
         # Update global values
-        self["train/samples"] = self["train/samples"] + metrics_agg["train/local_samples"]
-        self["train/tokens"] = self["train/tokens"] + metrics_agg["train/local_tokens"]
-        self["train/masked_tokens"] = self["train/masked_tokens"] + metrics_agg["train/local_num_pred"]
+        self["train/samples"] += int(metrics_agg["train/local_samples"])
+        self["train/tokens"] += int(metrics_agg["train/local_tokens"])
+        self["train/masked_tokens"] += int(
+            metrics_agg["train/local_num_pred"]
+        )
 
         # Build the metrics to log
         metrics_log = dict()
