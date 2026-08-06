@@ -3,7 +3,7 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-6
+#SBATCH --array=0-8
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -14,7 +14,18 @@
 
 set -euo pipefail
 
-job_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${NEOBERT_ROOT:-}" ]]; then
+    job_dir="$NEOBERT_ROOT/jobs/attention_ablation"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    job_dir="$SLURM_SUBMIT_DIR/jobs/attention_ablation"
+else
+    job_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+if [[ ! -f "$job_dir/common.sh" ]]; then
+    echo "Cannot locate jobs/attention_ablation/common.sh from $job_dir" >&2
+    echo "Submit from the NeoBERT root or export NEOBERT_ROOT explicitly." >&2
+    exit 2
+fi
 source "$job_dir/common.sh"
 resolve_attention_variant "${SLURM_ARRAY_TASK_ID:?This job must run as an array task.}"
 setup_attention_runtime
@@ -63,7 +74,7 @@ if [[ -n "${BABYLM_EVAL_ROOT:-}" ]]; then
 
     # The official evaluator keys its output by the model path's basename.
     # Every training export is named final_model, so give each array task a
-    # unique, scoped symlink to avoid seven concurrent jobs colliding.
+    # unique, scoped symlink to avoid nine concurrent jobs colliding.
     official_model_name="hf-$ATTENTION_VARIANT-seed-$SEED"
     official_model_path="$BENCHMARK_ROOT/$official_model_name"
     if [[ -e "$official_model_path" && ! -L "$official_model_path" ]]; then

@@ -55,6 +55,20 @@ def load_flash_adapter():
 padding_free_flash = load_flash_adapter()
 
 
+class TestVariantMatrix(unittest.TestCase):
+    def test_real_variants_are_canonicalized_and_registered(self):
+        self.assertEqual(benchmark_mlm.canonical_variant("real_torch"), "real-torch")
+        self.assertEqual(benchmark_mlm.canonical_variant("REAL-FLASH"), "real-flash")
+        self.assertEqual(
+            benchmark_mlm.VARIANT_MATRIX["real-torch"],
+            ("real", "torch"),
+        )
+        self.assertEqual(
+            benchmark_mlm.VARIANT_MATRIX["real-flash"],
+            ("real", "flash"),
+        )
+
+
 class ListDataset:
     column_names = ["input_ids"]
 

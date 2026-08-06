@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Shared, source-only helpers for the seven-way attention ablation.
+# Shared, source-only helpers for the nine-way attention ablation.
 
 ATTENTION_VARIANTS=(
     complex-native
@@ -10,9 +10,11 @@ ATTENTION_VARIANTS=(
     split-torch
     dual-native
     dual-torch
+    real-torch
+    real-flash
 )
-ATTENTION_SPACES=(complex complex complex split split dual dual)
-ATTENTION_BACKENDS=(native torch flash native torch native torch)
+ATTENTION_SPACES=(complex complex complex split split dual dual real real)
+ATTENTION_BACKENDS=(native torch flash native torch native torch torch flash)
 MODEL_CONFIGS=(
     attention-ablation-complex
     attention-ablation-complex
@@ -21,12 +23,14 @@ MODEL_CONFIGS=(
     attention-ablation-split
     attention-ablation-dual
     attention-ablation-dual
+    attention-ablation-real
+    attention-ablation-real
 )
 
 resolve_attention_variant() {
     local task_id="${1:?array task id is required}"
-    if [[ ! "$task_id" =~ ^[0-6]$ ]]; then
-        echo "Array task id must be an integer from 0 through 6; got '$task_id'." >&2
+    if [[ ! "$task_id" =~ ^[0-8]$ ]]; then
+        echo "Array task id must be an integer from 0 through 8; got '$task_id'." >&2
         return 2
     fi
     ATTENTION_VARIANT="${ATTENTION_VARIANTS[$task_id]}"
@@ -37,26 +41,39 @@ resolve_attention_variant() {
 }
 
 setup_attention_runtime() {
-    local common_dir neobert_default cache_root
+    local common_dir neobert_default cache_root missing_modules
     common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     neobert_default="$(cd "$common_dir/../.." && pwd)"
 
     NEOBERT_ROOT="${NEOBERT_ROOT:-$neobert_default}"
     COMPLEX_ATTENTION_ROOT="${COMPLEX_ATTENTION_ROOT:-$(cd "$NEOBERT_ROOT/.." && pwd)}"
-    COMPLEX_ATTN_PYTHON="${COMPLEX_ATTN_PYTHON:-/mnt/nfs/home/st171793/.conda/envs/pytorch_dev/bin/python}"
-    export NEOBERT_ROOT COMPLEX_ATTENTION_ROOT COMPLEX_ATTN_PYTHON
+    CONDA_ENV_NAME="${CONDA_ENV_NAME:-attention_dev}"
+    export NEOBERT_ROOT COMPLEX_ATTENTION_ROOT CONDA_ENV_NAME
 
-    if [[ ! -x "$COMPLEX_ATTN_PYTHON" ]]; then
-        echo "COMPLEX_ATTN_PYTHON is not executable: $COMPLEX_ATTN_PYTHON" >&2
+    if ! command -v module >/dev/null 2>&1; then
+        echo "The cluster module command is unavailable; cannot initialize Conda." >&2
         return 2
     fi
-    export PATH="$(dirname "$COMPLEX_ATTN_PYTHON"):$PATH"
+    module purge
+    module load "${MINICONDA_MODULE:-Miniconda3}"
+    module load "${CUDA_MODULE:-CUDA/12.6.0}"
+    if [[ -z "${EBROOTMINICONDA3:-}" || ! -f "$EBROOTMINICONDA3/bin/activate" ]]; then
+        echo "Miniconda3 did not provide EBROOTMINICONDA3/bin/activate." >&2
+        return 2
+    fi
+    source "$EBROOTMINICONDA3/bin/activate"
+    conda activate "$CONDA_ENV_NAME"
 
-    if command -v module >/dev/null 2>&1; then
-        module load "${CUDA_MODULE:-CUDA/12.6.0}"
+    COMPLEX_ATTN_PYTHON="$(command -v python)"
+    export COMPLEX_ATTN_PYTHON
+    if [[ ! -x "$COMPLEX_ATTN_PYTHON" ]]; then
+        echo "Activated environment has no executable Python: $CONDA_ENV_NAME" >&2
+        return 2
     fi
 
-    export PYTHONNOUSERSITE=1
+    # Match an interactive `conda activate`: this environment currently uses
+    # both Conda and user-site packages for its pinned Python training stack.
+    unset PYTHONNOUSERSITE
     export PYTHONPATH="$NEOBERT_ROOT/src:$COMPLEX_ATTENTION_ROOT${CUSTOM_TORCH_PYTHONPATH:+:$CUSTOM_TORCH_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
     if [[ -d "$COMPLEX_ATTENTION_ROOT/pytorch/torch/lib" ]]; then
         export LD_LIBRARY_PATH="$COMPLEX_ATTENTION_ROOT/pytorch/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -68,4 +85,27 @@ setup_attention_runtime() {
     export TORCHINDUCTOR_CACHE_DIR="$cache_root/inductor"
     export CUDA_CACHE_PATH="$cache_root/cuda"
     export HF_HOME="${HF_HOME:-$COMPLEX_ATTENTION_ROOT/.cache/huggingface}"
+
+    missing_modules="$("$COMPLEX_ATTN_PYTHON" -c '
+import importlib.util
+
+required = (
+    "typing_extensions",
+    "torch",
+    "hydra",
+    "omegaconf",
+    "datasets",
+    "transformers",
+    "accelerate",
+    "deepspeed",
+    "wandb",
+)
+print(" ".join(name for name in required if importlib.util.find_spec(name) is None))
+')"
+    if [[ -n "$missing_modules" ]]; then
+        echo "Conda environment '$CONDA_ENV_NAME' is missing required modules: $missing_modules" >&2
+        echo "Install the NeoBERT Python stack once with:" >&2
+        echo "  PYTHONNOUSERSITE=1 python -m pip install -r $NEOBERT_ROOT/requirements-optibertneo-h100.txt" >&2
+        return 2
+    fi
 }

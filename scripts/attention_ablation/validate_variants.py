@@ -3,15 +3,23 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_IMPORT_ROOTS = (PROJECT_ROOT / "src", PROJECT_ROOT.parent)
+for import_root in reversed(LOCAL_IMPORT_ROOTS):
+    import_root_string = str(import_root)
+    if import_root_string not in sys.path:
+        sys.path.insert(0, import_root_string)
 
 from omegaconf import OmegaConf
 
 from neobert.model import NeoBERTConfig, NeoBERTLMHead
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_CONFIG_DIR = PROJECT_ROOT / "conf" / "model"
 VOCAB_SIZE = 30_522
 MAX_LENGTH = 512
@@ -35,6 +43,8 @@ VARIANTS = (
     Variant("split_torch", "attention-ablation-split.yaml", "split", "torch"),
     Variant("dual_native", "attention-ablation-dual.yaml", "dual", "native"),
     Variant("dual_torch", "attention-ablation-dual.yaml", "dual", "torch"),
+    Variant("real_torch", "attention-ablation-real.yaml", "real", "torch"),
+    Variant("real_flash", "attention-ablation-real.yaml", "real", "flash"),
 )
 
 

@@ -27,7 +27,7 @@ SPEC.loader.exec_module(validator)
 
 
 class TestAttentionAblationVariants(unittest.TestCase):
-    def test_exact_seven_variant_matrix_is_parameter_matched(self):
+    def test_exact_nine_variant_matrix_is_parameter_matched(self):
         self.assertEqual(
             [
                 (variant.attention_space, variant.attention_backend)
@@ -41,12 +41,14 @@ class TestAttentionAblationVariants(unittest.TestCase):
                 ("split", "torch"),
                 ("dual", "native"),
                 ("dual", "torch"),
+                ("real", "torch"),
+                ("real", "flash"),
             ],
         )
 
         counts = validator.validate_variants(verbose=False)
 
-        self.assertEqual(len(counts), 7)
+        self.assertEqual(len(counts), 9)
         self.assertEqual(
             set(counts.values()),
             {validator.EXPECTED_TRAINABLE_PARAMETERS},

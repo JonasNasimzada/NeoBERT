@@ -1,6 +1,6 @@
-# Equal-parameter complex-attention ablation
+# Equal-parameter attention-space ablation
 
-This recipe trains seven homogeneous masked-language models on BabyLM 2026
+This recipe trains nine homogeneous masked-language models on BabyLM 2026
 Strict. Every encoder layer in a model uses exactly one attention
 space/backend pair.
 
@@ -13,26 +13,32 @@ space/backend pair.
 | 4 | split complex | torch | 2,049 | 17,260,288 |
 | 5 | dual complex | native | 1,024 | 17,260,288 |
 | 6 | dual complex | torch | 1,024 | 17,260,288 |
+| 7 | real | torch | 2,562 | 17,260,288 |
+| 8 | real | flash | 2,562 | 17,260,288 |
 
 All models otherwise use 6 layers, width 256, 8 heads, GELU, RoPE, pre-RMSNorm,
 tied input/output embeddings, no bias in the MLM head, and no dropout. The
 parameter equality is exact; the validator checks both the total and every
 encoder layer before a sweep.
 
+This is parameter matching, not FLOP matching: the real-valued attention
+projections use fewer parameters, so their models use the wider 2,562-unit FFN
+to keep the layer and model totals identical.
+
 ## Packing contract
 
 The preprocessing job concatenates tokenized documents and writes exact
 512-token rows. It drops only the final incomplete tail, so training has no
 padding or unpadding overhead. The same packed rows and deterministic split are
-used by all seven models.
+used by all nine models.
 
 The rows intentionally do **not** contain `document_ids`. Direct Flash SDPA
-cannot represent NeoBERT's block-diagonal document mask. Consequently all seven
+cannot represent NeoBERT's block-diagonal document mask. Consequently all nine
 runs allow attention across document boundaries inside a packed row. This is
-the only controlled seven-way comparison that includes `complex/flash` without
-changing the attention semantics for that one run. If document boundaries must
-be isolated, use FlexAttention and treat that as a separate experiment; do not
-label it `flash`.
+the controlled nine-way comparison that includes `complex/flash` and
+`real/flash` without changing the attention semantics for those runs. If
+document boundaries must be isolated, use FlexAttention and treat that as a
+separate experiment; do not label it `flash`.
 
 ## Training budget
 
@@ -60,10 +66,37 @@ WordPiece token positions.
 ## One-time environment and data preparation
 
 Use the custom PyTorch/ComplexAttention environment built for A100 (`sm_80`).
-Do not use the repository's H100-only setup. The jobs expect these variables:
+Do not use the repository's H100-only setup. Every batch job purges inherited
+modules, loads `Miniconda3` and `CUDA/12.6.0`, initializes Conda through
+`$EBROOTMINICONDA3/bin/activate`, and activates `attention_dev`. The environment
+name can be overridden with `CONDA_ENV_NAME`.
+
+The jobs match normal interactive Conda activation, including packages already
+available from your user site, and check all required imports before doing
+expensive work. If that preflight reports missing packages, install the pinned
+Python-side stack directly into the environment. PyTorch is deliberately not
+part of this requirements file, so this keeps the custom
+ComplexAttention-compatible PyTorch build:
 
 ```bash
-export COMPLEX_ATTN_PYTHON=/path/to/the/custom/environment/bin/python
+module purge
+module load Miniconda3
+source "$EBROOTMINICONDA3/bin/activate"
+conda activate attention_dev
+PYTHONNOUSERSITE=1 python -m pip install -r requirements-optibertneo-h100.txt
+```
+
+Authenticate W&B once from the activated environment (or export
+`WANDB_API_KEY` through Slurm):
+
+```bash
+python -m wandb login
+```
+
+The jobs expect these variables:
+
+```bash
+export CONDA_ENV_NAME=attention_dev
 export COMPLEX_ATTENTION_ROOT=/mnt/nfs/home/st171793/ComplexAttention
 export DATASET_PATH=/shared/path/babylm-2026-strict-bert512-flat
 export HF_HOME=/shared/path/huggingface-cache
@@ -87,11 +120,14 @@ offline afterward.
 The CPU parameter check is safe to run before allocating a GPU:
 
 ```bash
-PYTHONPATH="$PWD/src:$COMPLEX_ATTENTION_ROOT" \
-  "$COMPLEX_ATTN_PYTHON" scripts/attention_ablation/validate_variants.py
+python scripts/attention_ablation/validate_variants.py
 ```
 
-Before the full run, launch a two-step seven-way A100 smoke array:
+The validator resolves the local NeoBERT and ComplexAttention source trees
+itself; it does not require an editable NeoBERT installation or a manual
+`PYTHONPATH`.
+
+Before the full run, launch a two-step nine-way A100 smoke array:
 
 ```bash
 export SMOKE_RUNS_ROOT=/shared/path/complex-attention-ablation-smoke
@@ -99,11 +135,14 @@ sbatch \
   --partition=slowlane \
   --gpus=A100:1 \
   --qos=hiwi_project \
-  --array=0-6 \
+  --array=0-8 \
   --time=00:20:00 \
   --export=ALL,RUNS_ROOT="$SMOKE_RUNS_ROOT",MAX_STEPS=2,WARMUP_STEPS=1,WANDB_MODE=disabled \
   jobs/attention_ablation/train.sbatch
 ```
+
+To smoke-test only the two real-valued additions, use the same command with
+`--array=7-8`.
 
 Set W&B and output locations, then submit the training array and its correlated
 benchmark array:
@@ -120,7 +159,7 @@ bash jobs/attention_ablation/submit.sh
 The submission script uses the requested resource command for both arrays:
 
 ```text
-sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-6 ...
+sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-8 ...
 ```
 
 Each training task first checks for an A100, SM80 code, BF16 support, and a
@@ -149,12 +188,14 @@ run the MLM zero-shot script when that variable is present, then upload parsed
 metrics and the complete official result directory to W&B. Keep the evaluator
 commit in the run notes so scores remain reproducible.
 
-The official harness pads variable-length MLM batches. For the strict
-`complex/flash` checkpoint, a scoped evaluator-only adapter runs each padded
-row at its true length and restores batch-shaped logits. This preserves the
-selected Flash backend and avoids silently falling back to Torch SDPA.
+The official harness pads variable-length MLM batches. For strict
+`complex/flash` and `real/flash` checkpoints, a scoped evaluator-only adapter
+runs each padded row at its true length and restores batch-shaped logits. This
+preserves the selected Flash backend and avoids silently falling back to Torch
+SDPA.
 
-`complex/torch` permits PyTorch's normal SDPA selection and may itself choose a
-Flash kernel on A100; `complex/flash` is the strict selector. Treat their quality
-as equivalent implementations and use the runtime/memory logs to distinguish
-dispatch behavior.
+The `torch` variants permit PyTorch's normal SDPA selection and may themselves
+choose a Flash kernel on A100; the `flash` variants strictly select PyTorch's
+Flash SDPA backend. They do not require the external `flash-attn` package.
+Treat the corresponding torch/flash pairs as equivalent implementations and
+use the runtime/memory logs to distinguish dispatch behavior.

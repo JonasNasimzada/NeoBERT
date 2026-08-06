@@ -3,6 +3,7 @@
 set -euo pipefail
 
 job_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+neobert_root="$(cd "$job_dir/../.." && pwd)"
 : "${DATASET_PATH:?Export DATASET_PATH before submitting the sweep.}"
 
 # Keep the resource request explicit here as well as in the sbatch files so a
@@ -12,7 +13,9 @@ train_job_id="$(
         --partition=slowlane \
         --gpus=A100:1 \
         --qos=hiwi_project \
-        --array=0-6 \
+        --array=0-8 \
+        --chdir="$neobert_root" \
+        --export=ALL,NEOBERT_ROOT="$neobert_root" \
         "$job_dir/train.sbatch"
 )"
 train_job_id="${train_job_id%%;*}"
@@ -22,7 +25,9 @@ benchmark_job_id="$(
         --partition=slowlane \
         --gpus=A100:1 \
         --qos=hiwi_project \
-        --array=0-6 \
+        --array=0-8 \
+        --chdir="$neobert_root" \
+        --export=ALL,NEOBERT_ROOT="$neobert_root" \
         --dependency="aftercorr:$train_job_id" \
         "$job_dir/benchmark.sbatch"
 )"

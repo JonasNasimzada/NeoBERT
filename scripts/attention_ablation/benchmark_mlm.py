@@ -29,6 +29,8 @@ VARIANT_MATRIX = {
     "split-torch": ("split", "torch"),
     "dual-native": ("dual", "native"),
     "dual-torch": ("dual", "torch"),
+    "real-torch": ("real", "torch"),
+    "real-flash": ("real", "flash"),
 }
 
 
@@ -440,7 +442,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True, help="Exported final_model directory")
     parser.add_argument("--dataset", type=Path, required=True, help="Prepared DatasetDict directory")
     parser.add_argument("--output", type=Path, required=True, help="Destination JSON report")
-    parser.add_argument("--variant", required=True, help="One of the seven attention variants")
+    parser.add_argument("--variant", required=True, help="One of the nine attention variants")
     parser.add_argument("--split", default="validation", help="Held-out DatasetDict split")
     parser.add_argument(
         "--contexts",
