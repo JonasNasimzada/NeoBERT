@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-# Shared, source-only helpers for the nine-way attention ablation.
+# Shared helpers for the calibrated nine-way ablation and the explicitly
+# budgeted, uncalibrated dual-number FlexAttention variant at index 9.
 
 ATTENTION_VARIANTS=(
     complex-native
@@ -12,9 +13,10 @@ ATTENTION_VARIANTS=(
     dual-torch
     real-torch
     real-flash
+    dual-flex
 )
-ATTENTION_SPACES=(complex complex complex split split dual dual real real)
-ATTENTION_BACKENDS=(native torch flash native torch native torch torch flash)
+ATTENTION_SPACES=(complex complex complex split split dual dual real real dual)
+ATTENTION_BACKENDS=(native torch flash native torch native torch torch flash flex)
 MODEL_CONFIGS=(
     attention-ablation-complex
     attention-ablation-complex
@@ -25,19 +27,59 @@ MODEL_CONFIGS=(
     attention-ablation-dual
     attention-ablation-real
     attention-ablation-real
+    attention-ablation-dual
+)
+
+# Backend-specific optimizer-step ceilings calibrated from the completed A100
+# pilot array (job 44088). Each target represents roughly 10,400 seconds of
+# optimizer work; setup, six validations/checkpoints, and final export bring
+# the end-to-end task close to the three-hour Slurm allocation. Faster
+# backends intentionally receive more steps and therefore see more tokens.
+# The dual-native and dual-torch values predate the real dual-number migration;
+# remeasure them before treating a new sweep as equal-time evidence.
+# Dual FlexAttention is intentionally uncalibrated and therefore has no target.
+ATTENTION_TARGET_STEP_COUNTS=(
+    95000   # complex-native
+    113500  # complex-torch
+    96000   # complex-flash
+    66500   # split-native
+    89000   # split-torch
+    52000   # dual-native
+    42000   # dual-torch
+    156000  # real-torch
+    153000  # real-flash
+    ""      # dual-flex (explicit MAX_STEPS required)
 )
 
 resolve_attention_variant() {
     local task_id="${1:?array task id is required}"
-    if [[ ! "$task_id" =~ ^[0-8]$ ]]; then
-        echo "Array task id must be an integer from 0 through 8; got '$task_id'." >&2
+    if [[ ! "$task_id" =~ ^[0-9]$ ]]; then
+        echo "Array task id must be an integer from 0 through 9; got '$task_id'." >&2
         return 2
     fi
     ATTENTION_VARIANT="${ATTENTION_VARIANTS[$task_id]}"
     ATTENTION_SPACE="${ATTENTION_SPACES[$task_id]}"
     ATTENTION_BACKEND="${ATTENTION_BACKENDS[$task_id]}"
     MODEL_CONFIG="${MODEL_CONFIGS[$task_id]}"
+    ATTENTION_TARGET_STEPS="${ATTENTION_TARGET_STEP_COUNTS[$task_id]}"
     export ATTENTION_VARIANT ATTENTION_SPACE ATTENTION_BACKEND MODEL_CONFIG
+    export ATTENTION_TARGET_STEPS
+}
+
+validate_experiment_id() {
+    local experiment_id="${1:?experiment id is required}"
+    if [[ ! "$experiment_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "EXPERIMENT_ID may contain only letters, digits, dot, underscore, and hyphen." >&2
+        return 2
+    fi
+}
+
+validate_attention_seed() {
+    local seed="${1:?seed is required}"
+    if [[ ! "$seed" =~ ^[0-9]+$ ]]; then
+        echo "SEED must be a nonnegative integer; got '$seed'." >&2
+        return 2
+    fi
 }
 
 setup_attention_runtime() {
@@ -56,7 +98,7 @@ setup_attention_runtime() {
     fi
     module purge
     module load "${MINICONDA_MODULE:-Miniconda3}"
-    module load "${CUDA_MODULE:-CUDA/12.6.0}"
+    module load "${CUDA_MODULE:-CUDA}"
     if [[ -z "${EBROOTMINICONDA3:-}" || ! -f "$EBROOTMINICONDA3/bin/activate" ]]; then
         echo "Miniconda3 did not provide EBROOTMINICONDA3/bin/activate." >&2
         return 2

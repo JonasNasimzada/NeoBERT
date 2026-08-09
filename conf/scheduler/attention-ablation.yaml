@@ -1,3 +1,5 @@
+# Local fallbacks. The Slurm sweep scales both values with each backend's
+# calibrated optimizer-step budget.
 warmup_steps: 100
 decay_steps: 1536
 decay: cosine

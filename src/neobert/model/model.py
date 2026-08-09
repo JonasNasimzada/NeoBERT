@@ -270,7 +270,6 @@ class NeoBERTConfig(PretrainedConfig):
         attention_backend: str = "auto",
         attention_spaces: Optional[List[str]] = None,
         attention_backends: Optional[List[str]] = None,
-        dual_tangent_chunk_size: int = 128,
         base_scale: float = 1.0 / (960.0**0.5),
         ngpt: bool = False,
         embedding_rms_norm: bool = False,
@@ -279,6 +278,9 @@ class NeoBERTConfig(PretrainedConfig):
         fused_swiglu: bool = True,
         **kwargs,
     ):
+        # Ignore the removed dual-attention JVP chunking option when loading an
+        # older checkpoint or Hydra configuration.
+        kwargs.pop("dual_tangent_chunk_size", None)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
         if hidden_size <= 0:
@@ -328,8 +330,6 @@ class NeoBERTConfig(PretrainedConfig):
             raise ValueError(
                 "attention_backend must be 'auto', 'native', 'torch', 'flash', or 'flex'"
             )
-        if dual_tangent_chunk_size <= 0:
-            raise ValueError("dual_tangent_chunk_size must be positive")
         if (
             attention_backends is None
             and attention_backend == "auto"
@@ -355,7 +355,7 @@ class NeoBERTConfig(PretrainedConfig):
                     "real": "real",
                     "complex": "ordinary complex",
                     "split": "split-complex",
-                    "dual": "dual-complex",
+                    "dual": "dual-number",
                 }[layer_space]
                 allowed = supported_backends[layer_space]
                 raise ValueError(
@@ -375,7 +375,6 @@ class NeoBERTConfig(PretrainedConfig):
         self.attention_backend = attention_backend
         self.attention_spaces = list(attention_spaces)
         self.attention_backends = list(attention_backends)
-        self.dual_tangent_chunk_size = dual_tangent_chunk_size
         self.base_scale = base_scale
         self.ngpt = ngpt
         self.embedding_rms_norm = embedding_rms_norm

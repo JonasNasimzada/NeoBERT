@@ -15,7 +15,7 @@ VALID_BACKENDS = {
     "real": {"torch", "flash"},
     "complex": {"native", "torch", "flash"},
     "split": {"native", "torch"},
-    "dual": {"native", "torch"},
+    "dual": {"native", "torch", "flex"},
 }
 
 
@@ -72,8 +72,16 @@ def main() -> None:
     model = NeoBERTLMHead(config).cuda().train()
     input_ids = torch.randint(0, config.vocab_size, (2, 16), device="cuda")
     labels = torch.randint(0, config.vocab_size, (2, 16), device="cuda")
+    # FlexAttention requires a BlockMask even for an otherwise unmasked smoke
+    # batch.  A single document id per row exercises the same model-level mask
+    # construction used by the packed training dataloader.
+    document_ids = (
+        torch.zeros_like(input_ids, dtype=torch.int32)
+        if args.backend == "flex"
+        else None
+    )
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        logits = model(input_ids)["logits"]
+        logits = model(input_ids, document_ids=document_ids)["logits"]
         loss = F.cross_entropy(
             logits.float().reshape(-1, config.vocab_size),
             labels.reshape(-1),

@@ -7,10 +7,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --mem=80G
 #SBATCH --time=03:00:00
 #SBATCH --output=ca-babylm-train-%A_%a.out
-#SBATCH --error=ca-babylm-train-%A_%a.err
 
 set -euo pipefail
 
@@ -32,14 +30,36 @@ setup_attention_runtime
 
 DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-3h-v1}"
 SEED="${SEED:-42}"
-MAX_STEPS="${MAX_STEPS:-1536}"
-WARMUP_STEPS="${WARMUP_STEPS:-100}"
+if [[ -z "${MAX_STEPS:-}" && -z "$ATTENTION_TARGET_STEPS" ]]; then
+    echo "$ATTENTION_VARIANT has no calibrated step budget; set MAX_STEPS explicitly." >&2
+    exit 2
+fi
+MAX_STEPS="${MAX_STEPS:-$ATTENTION_TARGET_STEPS}"
 MICRO_BATCH="${MICRO_BATCH:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
-MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-9900}"
+MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-10620}"
+validate_experiment_id "$EXPERIMENT_ID"
+validate_attention_seed "$SEED"
+if [[ ! "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_STEPS must be a positive integer; got '$MAX_STEPS'." >&2
+    exit 2
+fi
+WARMUP_STEPS="${WARMUP_STEPS:-$(( (MAX_STEPS * 100 + 1535) / 1536 ))}"
+CHECKPOINT_STEPS="${CHECKPOINT_STEPS:-$(( (MAX_STEPS + 5) / 6 ))}"
+EVAL_STEPS="${EVAL_STEPS:-$CHECKPOINT_STEPS}"
+LOG_INTERVAL="${LOG_INTERVAL:-$(( (MAX_STEPS + 99) / 100 ))}"
+for schedule_name in WARMUP_STEPS CHECKPOINT_STEPS EVAL_STEPS LOG_INTERVAL; do
+    schedule_value="${!schedule_name}"
+    if [[ ! "$schedule_value" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$schedule_name must be a positive integer; got '$schedule_value'." >&2
+        exit 2
+    fi
+done
+RUNS_ROOT="$RUNS_ROOT/$EXPERIMENT_ID"
 RUN_ROOT="$RUNS_ROOT/$ATTENTION_VARIANT/seed-$SEED"
-WANDB_RUN_ID="ca-${ATTENTION_VARIANT}-s${SEED}"
+WANDB_RUN_ID="ca-${EXPERIMENT_ID}-${ATTENTION_VARIANT}-s${SEED}"
 
 if (( MICRO_BATCH * GRAD_ACCUM != 32 )); then
     echo "MICRO_BATCH * GRAD_ACCUM must remain 32 for the controlled sweep." >&2
@@ -64,14 +84,18 @@ cd "$NEOBERT_ROOT"
     trainer.max_steps="$MAX_STEPS" \
     trainer.max_time_seconds="$MAX_TIME_SECONDS" \
     trainer.gradient_accumulation_steps="$GRAD_ACCUM" \
+    trainer.validation.eval_steps="$EVAL_STEPS" \
+    trainer.accelerate.save_steps="$CHECKPOINT_STEPS" \
+    trainer.model.save_steps="$CHECKPOINT_STEPS" \
     scheduler.warmup_steps="$WARMUP_STEPS" \
     scheduler.decay_steps="$MAX_STEPS" \
     dataloader.train.batch_size="$MICRO_BATCH" \
     dataloader.validation.batch_size="$MICRO_BATCH" \
     seed="$SEED" \
+    wandb.log_interval="$LOG_INTERVAL" \
     wandb.id="$WANDB_RUN_ID" \
-    wandb.name="$ATTENTION_VARIANT-seed-$SEED" \
-    wandb.group="complex-attention-babylm-2026-seed-$SEED" \
-    wandb.entity="${WANDB_ENTITY:-null}" \
+    wandb.name="$EXPERIMENT_ID-$ATTENTION_VARIANT-seed-$SEED" \
+    wandb.group="complex-attention-babylm-2026-$EXPERIMENT_ID-seed-$SEED" \
+    wandb.entity="${WANDB_ENTITY:-hyper_attention}" \
     wandb.project="${WANDB_PROJECT:-complex-attention-ablation}" \
     wandb.mode="${WANDB_MODE:-online}"

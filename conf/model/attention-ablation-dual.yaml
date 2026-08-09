@@ -1,7 +1,7 @@
 hidden_size: 256
 num_hidden_layers: 6
 num_attention_heads: 8
-intermediate_size: 1024
+intermediate_size: 2049
 rope: true
 rms_norm: true
 embedding_rms_norm: false
@@ -17,4 +17,3 @@ lm_head_bias: false
 ngpt: false
 attention_space: dual
 attention_backend: torch
-dual_tangent_chunk_size: 128

@@ -298,6 +298,7 @@ class TestBabyLMResultParsing(unittest.TestCase):
                 "entity": "",
                 "name": None,
                 "group": None,
+                "id_prefix": "a100-3h-v1",
             }
             benchmark_args = types.SimpleNamespace(
                 **common,
@@ -335,8 +336,8 @@ class TestBabyLMResultParsing(unittest.TestCase):
         self.assertEqual(
             [call["id"] for call in init_calls],
             [
-                "complex-native-seed-42-heldout-mlm",
-                "complex-native-seed-42-babylm",
+                "a100-3h-v1-complex-native-seed-42-heldout-mlm",
+                "a100-3h-v1-complex-native-seed-42-babylm",
             ],
         )
         self.assertEqual([call["resume"] for call in init_calls], ["allow", "allow"])

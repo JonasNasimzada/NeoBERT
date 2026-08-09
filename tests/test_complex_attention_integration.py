@@ -110,7 +110,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             "real": "real",
             "complex": "ordinary complex",
             "split": "split-complex",
-            "dual": "dual-complex",
+            "dual": "dual-number",
         }
 
         for space, allowed in backend_matrix.items():
@@ -835,7 +835,8 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         captured = {}
 
         def fake_attention(query, key, value, **kwargs):
-            captured["query_dtype"] = query[0][0].dtype
+            captured["query_dtype"] = query[0].dtype
+            captured["component_count"] = len(query)
             captured["compute_dtype"] = kwargs.get("compute_dtype")
             captured["keyword_names"] = set(kwargs)
             return value, None
@@ -851,8 +852,176 @@ class TestComplexAttentionIntegration(unittest.TestCase):
 
         self.assertEqual(output.shape, (2, 4, 8))
         self.assertEqual(captured["query_dtype"], torch.bfloat16)
+        self.assertEqual(captured["component_count"], 2)
         self.assertIsNone(captured["compute_dtype"])
         self.assertNotIn("tangent_mask_mod", captured["keyword_names"])
+        self.assertNotIn("tangent_chunk_size", captured["keyword_names"])
+
+    def test_dual_adapter_applies_rope_to_primal_and_dual_components(self):
+        config = NeoBERTConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            hidden_act="gelu",
+            vocab_size=32,
+            max_length=4,
+            rope=True,
+            attention_spaces=["dual"],
+            attention_backends=["torch"],
+        )
+        attention = model_module.NeoBERTComplexAttention(
+            config,
+            attention_space="dual",
+            attention_backend="torch",
+        )
+        primal_qkv = torch.randn(1, 4, 24)
+        dual_qkv = torch.randn_like(primal_qkv)
+        frequencies = precompute_freqs_cis(config.dim_head, 4)
+        captured = {}
+
+        def fake_attention(query, key, value, **kwargs):
+            captured["query"] = query
+            captured["key"] = key
+            return value, None
+
+        attention._dual_attention = fake_attention
+        with mock.patch.object(
+            attention.qkv,
+            "forward_real",
+            return_value=(primal_qkv, dual_qkv),
+        ):
+            attention(
+                torch.randn(1, 4, 8),
+                attn_mask=None,
+                key_padding_mask=None,
+                freqs_cis=frequencies,
+            )
+
+        expected = []
+        for qkv in (primal_qkv, dual_qkv):
+            query, key, _ = qkv.view(1, 4, 2, 12).chunk(3, dim=-1)
+            expected.append(apply_rotary_emb(query, key, frequencies))
+        self.assertEqual(len(captured["query"]), 2)
+        for component in range(2):
+            torch.testing.assert_close(
+                captured["query"][component],
+                expected[component][0].transpose(1, 2),
+            )
+            torch.testing.assert_close(
+                captured["key"][component],
+                expected[component][1].transpose(1, 2),
+            )
+
+    def test_dual_adapter_matches_explicit_dual_number_product_rule(self):
+        torch.manual_seed(2026)
+        config = NeoBERTConfig(
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            intermediate_size=8,
+            hidden_act="gelu",
+            vocab_size=16,
+            max_length=3,
+            rope=False,
+            attention_spaces=["dual"],
+            attention_backends=["torch"],
+        )
+        attention = model_module.NeoBERTComplexAttention(
+            config,
+            attention_space="dual",
+            attention_backend="torch",
+        ).double()
+        x = torch.randn(2, 3, 4, dtype=torch.float64)
+
+        qkv_primal = F.linear(x, attention.qkv.weight_primal)
+        qkv_dual = F.linear(x, attention.qkv.weight_dual)
+        q0, k0, v0 = (
+            component.transpose(1, 2)
+            for component in qkv_primal.view(2, 3, 1, 12).chunk(3, dim=-1)
+        )
+        q1, k1, v1 = (
+            component.transpose(1, 2)
+            for component in qkv_dual.view(2, 3, 1, 12).chunk(3, dim=-1)
+        )
+        scale = config.dim_head**-0.5
+        score0 = torch.matmul(q0, k0.transpose(-2, -1)) * scale
+        score1 = (
+            torch.matmul(q1, k0.transpose(-2, -1))
+            + torch.matmul(q0, k1.transpose(-2, -1))
+        ) * scale
+        probability0 = torch.softmax(score0, dim=-1)
+        probability1 = probability0 * (
+            score1 - (probability0 * score1).sum(dim=-1, keepdim=True)
+        )
+        output0 = torch.matmul(probability0, v0)
+        output1 = torch.matmul(probability0, v1) + torch.matmul(probability1, v0)
+        output0 = output0.transpose(1, 2).reshape(2, 3, 4)
+        output1 = output1.transpose(1, 2).reshape(2, 3, 4)
+        projected0 = F.linear(output0, attention.out_proj.weight_primal)
+        projected1 = F.linear(output1, attention.out_proj.weight_primal) + F.linear(
+            output0,
+            attention.out_proj.weight_dual,
+        )
+        expected = (
+            attention.readout[0] * projected0
+            + attention.readout[1] * projected1
+        )
+
+        actual = attention(
+            x,
+            attn_mask=None,
+            key_padding_mask=None,
+            freqs_cis=None,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+
+    def test_dual_adapter_routes_dense_and_block_masks_by_backend(self):
+        dense_mask = torch.eye(4, dtype=torch.bool)
+        key_padding_mask = torch.tensor([[False, False, True, True]])
+        block_mask = object()
+        for backend in ("native", "torch", "flex"):
+            with self.subTest(backend=backend):
+                config = NeoBERTConfig(
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=16,
+                    hidden_act="gelu",
+                    vocab_size=32,
+                    max_length=4,
+                    rope=False,
+                    attention_spaces=["dual"],
+                    attention_backends=[backend],
+                )
+                attention = model_module.NeoBERTComplexAttention(
+                    config,
+                    attention_space="dual",
+                    attention_backend=backend,
+                )
+                captured = {}
+
+                def fake_attention(query, key, value, **kwargs):
+                    captured.update(kwargs)
+                    return value, None
+
+                attention._dual_attention = fake_attention
+                attention(
+                    torch.randn(1, 4, 8),
+                    attn_mask=dense_mask,
+                    key_padding_mask=key_padding_mask,
+                    freqs_cis=None,
+                    block_mask=block_mask,
+                )
+
+                if backend == "flex":
+                    self.assertIsNone(captured["attn_mask"])
+                    self.assertIsNone(captured["key_padding_mask"])
+                    self.assertIs(captured["block_mask"], block_mask)
+                else:
+                    self.assertIs(captured["attn_mask"], dense_mask)
+                    self.assertIs(captured["key_padding_mask"], key_padding_mask)
+                    self.assertIsNone(captured["block_mask"])
 
     def test_padding_bias_stays_compact(self):
         pad_mask = torch.tensor(
@@ -1229,7 +1398,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         expected_pair_readout[0].fill_(1.0)
         expected_dual_readout = torch.zeros_like(dual_attention.readout)
         expected_dual_readout[0].fill_(1.0)
-        expected_dual_readout[2].fill_(1.0)
+        expected_dual_readout[1].fill_(1.0)
         torch.testing.assert_close(
             complex_attention.readout,
             expected_pair_readout,
@@ -1243,7 +1412,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             expected_dual_readout,
         )
         pair_bound = initialization_range / math.sqrt(2.0)
-        dual_bound = initialization_range / 2.0
+        dual_bound = initialization_range / math.sqrt(2.0)
         pair_weights = (
             complex_attention.qkv.weight_real,
             complex_attention.qkv.weight_imag,
@@ -1257,15 +1426,14 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         for weight in pair_weights:
             self.assertLessEqual(weight.detach().abs().max().item(), pair_bound)
         for projection in (dual_attention.qkv, dual_attention.out_proj):
-            for component in (projection.primal, projection.dual):
-                self.assertLessEqual(
-                    component.weight_real.detach().abs().max().item(),
-                    dual_bound,
-                )
-                self.assertLessEqual(
-                    component.weight_imag.detach().abs().max().item(),
-                    dual_bound,
-                )
+            self.assertLessEqual(
+                projection.weight_primal.detach().abs().max().item(),
+                dual_bound,
+            )
+            self.assertLessEqual(
+                projection.weight_dual.detach().abs().max().item(),
+                dual_bound,
+            )
 
 
 if __name__ == "__main__":

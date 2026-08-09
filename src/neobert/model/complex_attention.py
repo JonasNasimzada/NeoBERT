@@ -26,9 +26,9 @@ def _apply_pair_rope(
     key: tuple[Tensor, Tensor],
     freqs_cis: Tensor,
 ) -> tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor]]:
-    query_real, key_real = apply_rotary_emb(query[0], key[0], freqs_cis)
-    query_imag, key_imag = apply_rotary_emb(query[1], key[1], freqs_cis)
-    return (query_real, query_imag), (key_real, key_imag)
+    query_first, key_first = apply_rotary_emb(query[0], key[0], freqs_cis)
+    query_second, key_second = apply_rotary_emb(query[1], key[1], freqs_cis)
+    return (query_first, query_second), (key_first, key_second)
 
 
 class NeoBERTComplexAttention(nn.Module):
@@ -37,10 +37,10 @@ class NeoBERTComplexAttention(nn.Module):
         try:
             from complex_attention import (
                 ComplexLinear,
-                DualComplexPairLinear,
+                DualLinear,
                 SplitComplexLinear,
                 complex_attention,
-                dual_complex_pair_attention,
+                dual_attention,
                 split_complex_attention,
             )
         except ImportError as error:
@@ -54,10 +54,9 @@ class NeoBERTComplexAttention(nn.Module):
         self.head_dim = config.dim_head
         self.rope = config.rope
         self.attention_dropout = float(getattr(config, "attention_dropout", 0.0))
-        self.dual_tangent_chunk_size = config.dual_tangent_chunk_size
         self._complex_attention = complex_attention
         self._split_attention = split_complex_attention
-        self._dual_attention = dual_complex_pair_attention
+        self._dual_attention = dual_attention
 
         if self.space == "complex":
             self.qkv = ComplexLinear(config.hidden_size, config.hidden_size * 3, bias=False)
@@ -70,11 +69,11 @@ class NeoBERTComplexAttention(nn.Module):
             readout = torch.zeros(2, config.hidden_size)
             readout[0].fill_(1.0)
         elif self.space == "dual":
-            self.qkv = DualComplexPairLinear(config.hidden_size, config.hidden_size * 3, bias=False)
-            self.out_proj = DualComplexPairLinear(config.hidden_size, config.hidden_size, bias=False)
-            readout = torch.zeros(4, config.hidden_size)
+            self.qkv = DualLinear(config.hidden_size, config.hidden_size * 3, bias=False)
+            self.out_proj = DualLinear(config.hidden_size, config.hidden_size, bias=False)
+            readout = torch.zeros(2, config.hidden_size)
             readout[0].fill_(1.0)
-            readout[2].fill_(1.0)
+            readout[1].fill_(1.0)
         else:
             raise ValueError(f"unsupported complex attention space: {self.space}")
         self.readout = nn.Parameter(readout)
@@ -95,18 +94,17 @@ class NeoBERTComplexAttention(nn.Module):
                     layer.weight_real.uniform_(-bound, bound)
                     layer.weight_split.uniform_(-bound, bound)
         else:
-            bound = initialization_range / 2.0
+            bound = initialization_range / math.sqrt(2.0)
             layers = (self.qkv, self.out_proj)
             with torch.no_grad():
                 for layer in layers:
-                    for component in (layer.primal, layer.dual):
-                        component.weight_real.uniform_(-bound, bound)
-                        component.weight_imag.uniform_(-bound, bound)
+                    layer.weight_primal.uniform_(-bound, bound)
+                    layer.weight_dual.uniform_(-bound, bound)
         with torch.no_grad():
             self.readout.zero_()
             self.readout[0].fill_(1.0)
             if self.space == "dual":
-                self.readout[2].fill_(1.0)
+                self.readout[1].fill_(1.0)
 
     def _complex_forward(
         self,
@@ -188,20 +186,17 @@ class NeoBERTComplexAttention(nn.Module):
         block_mask: Any,
     ) -> Tensor:
         qkv_primal, qkv_dual = self.qkv.forward_real(x)
-        primal_parts = tuple(_reshape_qkv(component, self.num_heads, self.head_dim) for component in qkv_primal)
-        dual_parts = tuple(_reshape_qkv(component, self.num_heads, self.head_dim) for component in qkv_dual)
-        query = ((primal_parts[0][0], primal_parts[1][0]), (dual_parts[0][0], dual_parts[1][0]))
-        key = ((primal_parts[0][1], primal_parts[1][1]), (dual_parts[0][1], dual_parts[1][1]))
-        value = ((primal_parts[0][2], primal_parts[1][2]), (dual_parts[0][2], dual_parts[1][2]))
+        primal_parts = _reshape_qkv(qkv_primal, self.num_heads, self.head_dim)
+        dual_parts = _reshape_qkv(qkv_dual, self.num_heads, self.head_dim)
+        query = primal_parts[0], dual_parts[0]
+        key = primal_parts[1], dual_parts[1]
+        value = primal_parts[2], dual_parts[2]
         if self.rope:
-            query_primal, key_primal = _apply_pair_rope(query[0], key[0], freqs_cis)
-            query_dual, key_dual = _apply_pair_rope(query[1], key[1], freqs_cis)
-            query = query_primal, query_dual
-            key = key_primal, key_dual
+            query, key = _apply_pair_rope(query, key, freqs_cis)
 
-        query = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in query)
-        key = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in key)
-        value = tuple(tuple(_to_attention_layout(component) for component in pair) for pair in value)
+        query = tuple(_to_attention_layout(component) for component in query)
+        key = tuple(_to_attention_layout(component) for component in key)
+        value = tuple(_to_attention_layout(component) for component in value)
         uses_block_mask = self.backend == "flex" and block_mask is not None
         direct_mask = None if uses_block_mask else attn_mask
         direct_key_padding = None if uses_block_mask else key_padding_mask
@@ -214,13 +209,9 @@ class NeoBERTComplexAttention(nn.Module):
             scale=self.head_dim**-0.5,
             dropout_p=self.attention_dropout if self.training else 0.0,
             backend=self.backend,
-            tangent_chunk_size=self.dual_tangent_chunk_size,
-            block_mask=block_mask,
+            block_mask=block_mask if self.backend == "flex" else None,
         )
-        output = tuple(
-            tuple(_from_attention_layout(component) for component in pair)
-            for pair in output
-        )
+        output = tuple(_from_attention_layout(component) for component in output)
         return self.out_proj.forward_readout(output, self.readout)
 
     def forward(

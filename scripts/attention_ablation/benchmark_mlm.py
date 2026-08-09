@@ -29,6 +29,7 @@ VARIANT_MATRIX = {
     "split-torch": ("split", "torch"),
     "dual-native": ("dual", "native"),
     "dual-torch": ("dual", "torch"),
+    "dual-flex": ("dual", "flex"),
     "real-torch": ("real", "torch"),
     "real-flash": ("real", "flash"),
 }
@@ -389,8 +390,17 @@ def _log_to_wandb(report: Mapping, output_path: Path, args) -> None:
         return
     import wandb
 
+    id_prefix = getattr(args, "id_prefix", "").strip()
+    run_id = "-".join(
+        part
+        for part in (
+            id_prefix,
+            f"{args.variant}-seed-{args.seed}-heldout-mlm",
+        )
+        if part
+    )
     run = wandb.init(
-        id=_wandb_identifier(f"{args.variant}-seed-{args.seed}-heldout-mlm"),
+        id=_wandb_identifier(run_id),
         resume="allow",
         project=args.project,
         entity=args.entity or None,
@@ -401,6 +411,7 @@ def _log_to_wandb(report: Mapping, output_path: Path, args) -> None:
         tags=["benchmark", "heldout-mlm", args.variant],
         config={
             "variant": args.variant,
+            "experiment_id": id_prefix or None,
             "model": str(args.model.resolve()),
             "dataset": str(args.dataset.resolve()),
             "split": args.split,
@@ -454,6 +465,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-tokens", type=int, default=DEFAULT_BATCH_TOKENS)
     parser.add_argument("--mask-probability", type=float, default=0.20)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--id-prefix",
+        default="",
+        help="Experiment prefix used to isolate the resumable W&B run id",
+    )
     parser.add_argument(
         "--allow-incomplete",
         action="store_true",

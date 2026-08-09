@@ -32,11 +32,15 @@ setup_attention_runtime
 
 DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-3h-v1}"
 SEED="${SEED:-42}"
+validate_experiment_id "$EXPERIMENT_ID"
+validate_attention_seed "$SEED"
+RUNS_ROOT="$RUNS_ROOT/$EXPERIMENT_ID"
 RUN_ROOT="$RUNS_ROOT/$ATTENTION_VARIANT/seed-$SEED"
 MODEL_PATH="$RUN_ROOT/final_model"
 BENCHMARK_ROOT="$RUN_ROOT/benchmarks"
-WANDB_GROUP="complex-attention-babylm-2026-seed-$SEED"
+WANDB_GROUP="complex-attention-babylm-2026-$EXPERIMENT_ID-seed-$SEED"
 
 if [[ ! -f "$MODEL_PATH/config.json" ]]; then
     echo "Completed final export is missing: $MODEL_PATH/config.json" >&2
@@ -53,8 +57,9 @@ cd "$NEOBERT_ROOT"
     --output "$BENCHMARK_ROOT/heldout_mlm.json" \
     --variant "$ATTENTION_VARIANT" \
     --seed "$SEED" \
+    --id-prefix "$EXPERIMENT_ID" \
     --project "${WANDB_PROJECT:-complex-attention-ablation}" \
-    --entity "${WANDB_ENTITY:-}" \
+    --entity "${WANDB_ENTITY:-hyper_attention}" \
     --group "$WANDB_GROUP" \
     --mode "${WANDB_MODE:-online}"
 
@@ -75,7 +80,7 @@ if [[ -n "${BABYLM_EVAL_ROOT:-}" ]]; then
     # The official evaluator keys its output by the model path's basename.
     # Every training export is named final_model, so give each array task a
     # unique, scoped symlink to avoid nine concurrent jobs colliding.
-    official_model_name="hf-$ATTENTION_VARIANT-seed-$SEED"
+    official_model_name="hf-$EXPERIMENT_ID-$ATTENTION_VARIANT-seed-$SEED"
     official_model_path="$BENCHMARK_ROOT/$official_model_name"
     if [[ -e "$official_model_path" && ! -L "$official_model_path" ]]; then
         echo "Refusing to replace non-symlink official model path: $official_model_path" >&2
@@ -98,8 +103,9 @@ if [[ -n "${BABYLM_EVAL_ROOT:-}" ]]; then
         --results "$BABYLM_RESULTS_ROOT" \
         --variant "$ATTENTION_VARIANT" \
         --seed "$SEED" \
+        --id-prefix "$EXPERIMENT_ID" \
         --project "${WANDB_PROJECT:-complex-attention-ablation}" \
-        --entity "${WANDB_ENTITY:-}" \
+        --entity "${WANDB_ENTITY:-hyper_attention}" \
         --group "$WANDB_GROUP" \
         --mode "${WANDB_MODE:-online}"
 else

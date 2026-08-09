@@ -200,8 +200,17 @@ def _log_to_wandb(metrics: Mapping[str, float], output: Path, args) -> None:
         return
     import wandb
 
+    id_prefix = getattr(args, "id_prefix", "").strip()
+    run_id = "-".join(
+        part
+        for part in (
+            id_prefix,
+            f"{args.variant}-seed-{args.seed}-babylm",
+        )
+        if part
+    )
     run = wandb.init(
-        id=_identifier(f"{args.variant}-seed-{args.seed}-babylm"),
+        id=_identifier(run_id),
         resume="allow",
         project=args.project,
         entity=args.entity or None,
@@ -212,6 +221,7 @@ def _log_to_wandb(metrics: Mapping[str, float], output: Path, args) -> None:
         tags=["benchmark", "babylm", args.variant],
         config={
             "variant": args.variant,
+            "experiment_id": id_prefix or None,
             "seed": args.seed,
             "results_root": str(args.results.resolve()),
             "metric_count": len(metrics),
@@ -237,6 +247,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--results", type=Path, required=True, help="Official BabyLM results root")
     parser.add_argument("--variant", required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--id-prefix",
+        default="",
+        help="Experiment prefix used to isolate the resumable W&B run id",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--project", default="complex-attention-ablation")
     parser.add_argument("--entity", default=os.environ.get("WANDB_ENTITY", ""))

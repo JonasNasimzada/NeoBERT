@@ -17,4 +17,3 @@ lm_head_bias: false
 ngpt: false
 attention_space: complex
 attention_backend: torch
-dual_tangent_chunk_size: 128
