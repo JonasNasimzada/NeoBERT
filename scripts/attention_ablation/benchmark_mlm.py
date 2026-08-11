@@ -19,7 +19,7 @@ from torch.nn import functional as F
 
 EXPECTED_TRAINABLE_PARAMETERS = 17_260_288
 DEFAULT_CONTEXT_LENGTHS = (128, 256, 512)
-DEFAULT_TOKEN_BUDGET = 1_048_576
+DEFAULT_TOKEN_BUDGET = 2_097_152
 DEFAULT_BATCH_TOKENS = 4_096
 VARIANT_MATRIX = {
     "complex-native": ("complex", "native"),
@@ -251,6 +251,41 @@ def _warm_up(
     torch.cuda.synchronize(device)
 
 
+def cuda_memory_metrics(
+    device: torch.device,
+    *,
+    baseline_allocated_bytes: int,
+    baseline_reserved_bytes: int,
+) -> dict[str, int]:
+    """Return explicit allocator peaks and incremental benchmark workspace.
+
+    These are PyTorch CUDA allocator measurements, not HBM read/write traffic.
+    The baseline is sampled after warm-up, so the allocated delta separates the
+    model's resident allocation from the additional inference workspace.
+    """
+    peak_allocated = int(torch.cuda.max_memory_allocated(device))
+    peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    device_total = int(torch.cuda.get_device_properties(device).total_memory)
+    return {
+        "baseline_cuda_memory_allocated_bytes": int(baseline_allocated_bytes),
+        "baseline_cuda_memory_reserved_bytes": int(baseline_reserved_bytes),
+        "peak_cuda_memory_allocated_bytes": peak_allocated,
+        "peak_cuda_memory_reserved_bytes": peak_reserved,
+        "peak_cuda_workspace_allocated_bytes": max(
+            peak_allocated - int(baseline_allocated_bytes),
+            0,
+        ),
+        "peak_cuda_workspace_reserved_bytes": max(
+            peak_reserved - int(baseline_reserved_bytes),
+            0,
+        ),
+        "device_total_memory_bytes": device_total,
+        # Compatibility aliases retained for existing reports and dashboards.
+        "peak_memory_bytes": peak_allocated,
+        "peak_memory_reserved_bytes": peak_reserved,
+    }
+
+
 def evaluate_context(
     model,
     dataset,
@@ -276,6 +311,8 @@ def evaluate_context(
         device=device,
     )
 
+    baseline_allocated_bytes = int(torch.cuda.memory_allocated(device))
+    baseline_reserved_bytes = int(torch.cuda.memory_reserved(device))
     torch.cuda.reset_peak_memory_stats(device)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     loss_sum = torch.zeros((), dtype=torch.float64, device=device)
@@ -338,7 +375,7 @@ def evaluate_context(
     mean_loss = loss_sum.item() / masked_tokens
     accuracy = correct_sum.item() / masked_tokens
     perplexity = math.exp(mean_loss)
-    return {
+    metrics = {
         "context_length": context_length,
         "batch_size": batch_tokens // context_length,
         "evaluated_tokens": evaluated_tokens,
@@ -350,9 +387,15 @@ def evaluate_context(
         "accuracy": accuracy,
         "elapsed_seconds": elapsed_seconds,
         "tokens_per_second": evaluated_tokens / elapsed_seconds,
-        "peak_memory_bytes": torch.cuda.max_memory_allocated(device),
-        "peak_memory_reserved_bytes": torch.cuda.max_memory_reserved(device),
     }
+    metrics.update(
+        cuda_memory_metrics(
+            device,
+            baseline_allocated_bytes=baseline_allocated_bytes,
+            baseline_reserved_bytes=baseline_reserved_bytes,
+        )
+    )
+    return metrics
 
 
 def _atomic_write_json(path: Path, payload: Mapping) -> None:
@@ -430,6 +473,17 @@ def _log_to_wandb(report: Mapping, output_path: Path, args) -> None:
             for name, value in metrics.items():
                 if isinstance(value, (int, float)):
                     scalars[f"{prefix}/{name}"] = value
+        if report["results"]:
+            result_values = tuple(report["results"].values())
+            for metric_name in (
+                "peak_cuda_memory_allocated_bytes",
+                "peak_cuda_memory_reserved_bytes",
+                "peak_cuda_workspace_allocated_bytes",
+                "peak_cuda_workspace_reserved_bytes",
+            ):
+                scalars[f"benchmark/mlm/max/{metric_name}"] = max(
+                    int(metrics[metric_name]) for metrics in result_values
+                )
         run.log(scalars)
 
         artifact = wandb.Artifact(
@@ -591,11 +645,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"ppl={metrics['perplexity']:.3f}, "
             f"accuracy={metrics['accuracy']:.4f}, "
             f"tokens/s={metrics['tokens_per_second']:,.1f}, "
-            f"peak={metrics['peak_memory_bytes'] / 2**30:.2f} GiB"
+            f"peak_allocated={metrics['peak_cuda_memory_allocated_bytes'] / 2**30:.2f} GiB, "
+            f"peak_reserved={metrics['peak_cuda_memory_reserved_bytes'] / 2**30:.2f} GiB, "
+            f"workspace={metrics['peak_cuda_workspace_allocated_bytes'] / 2**30:.2f} GiB"
         )
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "heldout_mlm",
         "variant": args.variant,
         "model": str(args.model.resolve()),
@@ -603,6 +659,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "split": args.split,
         "parameter_dtype": "float32",
         "compute_dtype": "bfloat16",
+        "memory_measurement": (
+            "PyTorch CUDA allocator bytes after warm-up; this is allocation "
+            "footprint, not HBM read/write traffic"
+        ),
         "device": torch.cuda.get_device_name(device),
         "seed": args.seed,
         "mask_probability": args.mask_probability,

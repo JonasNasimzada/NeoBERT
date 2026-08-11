@@ -75,13 +75,13 @@ done
         self.assertEqual(
             completed.stdout.splitlines(),
             [
-                "complex-native:complex:native:42000",
-                "complex-torch:complex:torch:42000",
-                "complex-flash:complex:flash:42000",
-                "split-native:split:native:42000",
-                "split-torch:split:torch:42000",
-                "real-torch:real:torch:42000",
-                "real-flash:real:flash:42000",
+                "complex-native:complex:native:84000",
+                "complex-torch:complex:torch:84000",
+                "complex-flash:complex:flash:84000",
+                "split-native:split:native:84000",
+                "split-torch:split:torch:84000",
+                "real-torch:real:torch:84000",
+                "real-flash:real:flash:84000",
             ],
         )
 

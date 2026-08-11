@@ -68,6 +68,30 @@ class TestVariantMatrix(unittest.TestCase):
             ("real", "flash"),
         )
 
+    def test_heldout_token_budget_is_doubled(self):
+        self.assertEqual(benchmark_mlm.DEFAULT_TOKEN_BUDGET, 2_097_152)
+
+
+class TestBenchmarkMemoryMetrics(unittest.TestCase):
+    def test_allocator_peaks_include_baseline_and_incremental_workspace(self):
+        properties = types.SimpleNamespace(total_memory=80 * 2**30)
+        with (
+            mock.patch.object(torch.cuda, "max_memory_allocated", return_value=900),
+            mock.patch.object(torch.cuda, "max_memory_reserved", return_value=1200),
+            mock.patch.object(torch.cuda, "get_device_properties", return_value=properties),
+        ):
+            metrics = benchmark_mlm.cuda_memory_metrics(
+                torch.device("cuda"),
+                baseline_allocated_bytes=600,
+                baseline_reserved_bytes=1000,
+            )
+
+        self.assertEqual(metrics["peak_cuda_workspace_allocated_bytes"], 300)
+        self.assertEqual(metrics["peak_cuda_workspace_reserved_bytes"], 200)
+        self.assertEqual(metrics["peak_memory_bytes"], 900)
+        self.assertEqual(metrics["peak_memory_reserved_bytes"], 1200)
+        self.assertEqual(metrics["device_total_memory_bytes"], 80 * 2**30)
+
 
 class ListDataset:
     column_names = ["input_ids"]
@@ -251,6 +275,36 @@ class TestBabyLMResultParsing(unittest.TestCase):
         self.assertEqual(
             sources["benchmark/babylm/finetune/glue/mnli"],
             "finetune.txt",
+        )
+
+    def test_resource_report_is_logged_under_system_namespace(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report = Path(temporary_directory) / "resources.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "peak_gpu_process_memory_bytes": 12_345,
+                        "peak_host_rss_bytes": 67_890,
+                        "nested": {"samples": 7},
+                        "available": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metrics, sources = log_babylm_results.collect_resource_metrics(report)
+
+        self.assertEqual(
+            metrics["benchmark/babylm/system/peak_gpu_process_memory_bytes"],
+            12_345,
+        )
+        self.assertEqual(
+            metrics["benchmark/babylm/system/nested/samples"],
+            7,
+        )
+        self.assertNotIn("benchmark/babylm/system/available", metrics)
+        self.assertEqual(
+            sources["benchmark/babylm/system/peak_host_rss_bytes"],
+            str(report.resolve()),
         )
 
     def test_offline_wandb_jobs_use_stable_resumable_ids(self):

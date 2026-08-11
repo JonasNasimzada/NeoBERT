@@ -24,8 +24,8 @@ MODEL_CONFIGS=(
 )
 
 # Equal-step/equal-token budget for the controlled seven-way sweep. At effective
-# batch 32 and context 512, every model sees 688,128,000 token positions.
-ATTENTION_EQUAL_TOKEN_STEPS=42000
+# batch 32 and context 512, every model sees 1,376,256,000 token positions.
+ATTENTION_EQUAL_TOKEN_STEPS=84000
 
 resolve_attention_variant() {
     local task_id="${1:?array task id is required}"

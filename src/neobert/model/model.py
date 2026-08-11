@@ -186,7 +186,7 @@ def _prepare_backend_padding_metadata(key_padding_mask, attention_spaces, attent
     if key_padding_mask is None:
         return None
     needs_metadata = any(
-        backend == "flash" and space in ("real", "complex")
+        backend == "flash" and space in ("real", "complex", "split", "dual")
         for space, backend in zip(attention_spaces, attention_backends)
     )
     if not needs_metadata:
@@ -278,6 +278,9 @@ class NeoBERTConfig(PretrainedConfig):
         fused_swiglu: bool = True,
         **kwargs,
     ):
+        # Ignore the removed dual-attention JVP chunking option when loading an
+        # older checkpoint or Hydra configuration.
+        kwargs.pop("dual_tangent_chunk_size", None)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
         if hidden_size <= 0:
@@ -313,15 +316,18 @@ class NeoBERTConfig(PretrainedConfig):
         if flash_attention is not None and not isinstance(flash_attention, bool):
             raise ValueError("flash_attention must be a bool or None")
         self.flash_attention = flash_attention
-        valid_spaces = ("real", "complex", "split")
+        valid_spaces = ("real", "complex", "split", "dual")
         valid_backends = ("auto", "native", "torch", "flash", "flex")
         supported_backends = {
             "real": ("auto", "torch", "flash", "flex"),
             "complex": ("auto", "native", "torch", "flash", "flex"),
-            "split": ("auto", "native", "torch", "flex"),
+            "split": ("auto", "native", "torch", "flash", "flex"),
+            "dual": ("auto", "native", "torch", "flash", "flex"),
         }
         if attention_space not in valid_spaces:
-            raise ValueError("attention_space must be 'real', 'complex', or 'split'")
+            raise ValueError(
+                "attention_space must be 'real', 'complex', 'split', or 'dual'"
+            )
         if attention_backend not in valid_backends:
             raise ValueError(
                 "attention_backend must be 'auto', 'native', 'torch', 'flash', or 'flex'"
@@ -351,6 +357,7 @@ class NeoBERTConfig(PretrainedConfig):
                     "real": "real",
                     "complex": "ordinary complex",
                     "split": "split-complex",
+                    "dual": "dual-number",
                 }[layer_space]
                 allowed = supported_backends[layer_space]
                 raise ValueError(
@@ -365,6 +372,22 @@ class NeoBERTConfig(PretrainedConfig):
                 raise ValueError(
                     "real, ordinary-complex, and split-complex FlexAttention "
                     "do not support attention_dropout"
+                )
+            if (
+                attention_dropout > 0.0
+                and layer_space == "split"
+                and layer_backend == "flash"
+            ):
+                raise ValueError(
+                    "split-complex FlashAttention does not support attention_dropout"
+                )
+            if (
+                attention_dropout > 0.0
+                and layer_space == "dual"
+                and layer_backend == "flash"
+            ):
+                raise ValueError(
+                    "dual-number FlashAttention does not support attention_dropout"
                 )
         self.attention_space = attention_space
         self.attention_backend = attention_backend

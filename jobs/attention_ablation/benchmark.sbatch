@@ -32,7 +32,7 @@ setup_attention_runtime
 
 DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-3h-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-1p376b-v1}"
 SEED="${SEED:-42}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
@@ -82,6 +82,7 @@ if [[ -n "${BABYLM_EVAL_ROOT:-}" ]]; then
     # unique, scoped symlink to avoid seven concurrent jobs colliding.
     official_model_name="hf-$EXPERIMENT_ID-$ATTENTION_VARIANT-seed-$SEED"
     official_model_path="$BENCHMARK_ROOT/$official_model_name"
+    resource_report="$BENCHMARK_ROOT/babylm_resource_usage.json"
     if [[ -e "$official_model_path" && ! -L "$official_model_path" ]]; then
         echo "Refusing to replace non-symlink official model path: $official_model_path" >&2
         exit 2
@@ -94,13 +95,19 @@ if [[ -n "${BABYLM_EVAL_ROOT:-}" ]]; then
         cd "$eval_workdir"
         export NEOBERT_BABYLM_FORCE_BF16=1
         export PYTHONPATH="$NEOBERT_ROOT/scripts/attention_ablation/babylm_compat:$PYTHONPATH"
-        bash -e "$eval_script" "$official_model_path" mlm "${BABYLM_EVAL_DATA:-evaluation_data/full_eval}"
+        "$COMPLEX_ATTN_PYTHON" \
+            "$NEOBERT_ROOT/scripts/attention_ablation/run_with_resource_monitor.py" \
+            --output "$resource_report" \
+            --sample-interval "${BENCHMARK_MEMORY_SAMPLE_INTERVAL:-0.25}" \
+            -- bash -e "$eval_script" "$official_model_path" mlm \
+            "${BABYLM_EVAL_DATA:-evaluation_data/full_eval}"
     )
 
     default_results_root="$eval_workdir/results/$official_model_name"
     BABYLM_RESULTS_ROOT="${BABYLM_RESULTS_ROOT:-$default_results_root}"
     "$COMPLEX_ATTN_PYTHON" scripts/attention_ablation/log_babylm_results.py \
         --results "$BABYLM_RESULTS_ROOT" \
+        --resource-report "$resource_report" \
         --variant "$ATTENTION_VARIANT" \
         --seed "$SEED" \
         --id-prefix "$EXPERIMENT_ID" \

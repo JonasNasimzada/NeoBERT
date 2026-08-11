@@ -64,13 +64,15 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         backend_matrix = {
             "real": ("auto", "torch", "flash", "flex"),
             "complex": ("auto", "native", "torch", "flash", "flex"),
-            "split": ("auto", "native", "torch", "flex"),
+            "split": ("auto", "native", "torch", "flash", "flex"),
+            "dual": ("auto", "native", "torch", "flash", "flex"),
         }
         all_backends = {"auto", "native", "torch", "flash", "flex"}
         space_names = {
             "real": "real",
             "complex": "ordinary complex",
             "split": "split-complex",
+            "dual": "dual-number",
         }
 
         for space, allowed in backend_matrix.items():
@@ -158,8 +160,37 @@ class TestComplexAttentionIntegration(unittest.TestCase):
                     attention_spaces=[space],
                     attention_backends=["flex"],
                 )
+
+        with self.assertRaisesRegex(
+            ValueError, "split-complex FlashAttention.*attention_dropout"
+        ):
+            NeoBERTConfig(
+                num_hidden_layers=1,
+                attention_dropout=0.1,
+                attention_spaces=["split"],
+                attention_backends=["flash"],
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "dual-number FlashAttention.*attention_dropout"
+        ):
+            NeoBERTConfig(
+                num_hidden_layers=1,
+                attention_dropout=0.1,
+                attention_spaces=["dual"],
+                attention_backends=["flash"],
+            )
+
+        dual_flex = NeoBERTConfig(
+            num_hidden_layers=1,
+            attention_dropout=0.1,
+            attention_spaces=["dual"],
+            attention_backends=["flex"],
+        )
+        self.assertEqual(dual_flex.attention_dropout, 0.1)
+
     def test_complex_adapters_apply_attention_dropout_only_while_training(self):
-        for space in ("complex", "split"):
+        for space in ("complex", "split", "dual"):
             with self.subTest(space=space):
                 config = NeoBERTConfig(
                     hidden_size=8,
@@ -326,6 +357,8 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             ("complex", "torch"),
             ("split", "native"),
             ("split", "torch"),
+            ("dual", "native"),
+            ("dual", "torch"),
         )
 
         for use_autocast in (False, True):
@@ -393,6 +426,9 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             ("complex", "native"),
             ("split", "torch"),
             ("split", "native"),
+            ("dual", "torch"),
+            ("dual", "native"),
+            ("dual", "flex"),
         )
 
         for index, (space, backend) in enumerate(combinations):
@@ -444,7 +480,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
                 )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_ordinary_complex_flash_takes_bfloat16_optimizer_step(self):
+    def test_complex_flash_backends_take_low_precision_optimizer_steps(self):
         flash_available = getattr(
             torch.backends.cuda,
             "is_flash_attention_available",
@@ -453,22 +489,6 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         if not flash_available():
             self.skipTest("this PyTorch build has no Flash SDPA")
 
-        torch.manual_seed(1234)
-        config = NeoBERTConfig(
-            hidden_size=8,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            intermediate_size=16,
-            hidden_act="gelu",
-            vocab_size=19,
-            max_length=4,
-            rope=False,
-            dropout=0.0,
-            attention_space="complex",
-            attention_backend="flash",
-        )
-        model = NeoBERTLMHead(config).cuda().train()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
         input_ids = torch.tensor(
             [[1, 2, 3, 4], [5, 6, 7, 8]],
             device="cuda",
@@ -477,36 +497,54 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             [[2, 3, 4, 5], [6, 7, 8, 9]],
             device="cuda",
         )
-        attention = model.model.transformer_encoder[0].complex_attention
-        before = {
-            name: parameter.detach().clone()
-            for name, parameter in attention.named_parameters()
-        }
-
-        optimizer.zero_grad(set_to_none=True)
         autocast_dtype = (
             torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         )
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            logits = model(input_ids)["logits"]
-            loss = F.cross_entropy(
-                logits.float().reshape(-1, config.vocab_size),
-                labels.reshape(-1),
-            )
-        self.assertTrue(torch.isfinite(loss))
-        loss.backward()
-        for name, parameter in attention.named_parameters():
-            self.assertIsNotNone(parameter.grad, name)
-            self.assertTrue(torch.isfinite(parameter.grad).all(), name)
-            self.assertGreater(parameter.grad.count_nonzero().item(), 0, name)
+        for index, space in enumerate(("complex", "split", "dual")):
+            with self.subTest(space=space):
+                torch.manual_seed(1234 + index)
+                config = NeoBERTConfig(
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    intermediate_size=16,
+                    hidden_act="gelu",
+                    vocab_size=19,
+                    max_length=4,
+                    rope=False,
+                    dropout=0.0,
+                    attention_space=space,
+                    attention_backend="flash",
+                )
+                model = NeoBERTLMHead(config).cuda().train()
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+                attention = model.model.transformer_encoder[0].complex_attention
+                before = {
+                    name: parameter.detach().clone()
+                    for name, parameter in attention.named_parameters()
+                }
 
-        optimizer.step()
-        self.assertTrue(
-            any(
-                not torch.equal(before[name], parameter.detach())
-                for name, parameter in attention.named_parameters()
-            )
-        )
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast("cuda", dtype=autocast_dtype):
+                    logits = model(input_ids)["logits"]
+                    loss = F.cross_entropy(
+                        logits.float().reshape(-1, config.vocab_size),
+                        labels.reshape(-1),
+                    )
+                self.assertTrue(torch.isfinite(loss))
+                loss.backward()
+                for name, parameter in attention.named_parameters():
+                    self.assertIsNotNone(parameter.grad, name)
+                    self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                    self.assertGreater(parameter.grad.count_nonzero().item(), 0, name)
+
+                optimizer.step()
+                self.assertTrue(
+                    any(
+                        not torch.equal(before[name], parameter.detach())
+                        for name, parameter in attention.named_parameters()
+                    )
+                )
 
     def test_meta_state_assignment_regenerates_nonpersistent_rope(self):
         config = NeoBERTConfig(
@@ -533,7 +571,7 @@ class TestComplexAttentionIntegration(unittest.TestCase):
 
     def test_half_model_runs_all_complex_attention_spaces(self):
         input_ids = torch.tensor([[1, 2, 3, 0]])
-        for space in ("complex", "split"):
+        for space in ("complex", "split", "dual"):
             with self.subTest(space=space):
                 config = NeoBERTConfig(
                     hidden_size=8,
@@ -656,26 +694,37 @@ class TestComplexAttentionIntegration(unittest.TestCase):
     def test_padding_metadata_is_prepared_once_for_flash_backends(self):
         key_padding_mask = torch.tensor([[False, False, True, True]])
         sentinel = object()
-        with mock.patch(
-            "complex_attention.prepare_key_padding_mask",
-            return_value=sentinel,
-        ) as prepare:
-            actual = model_module._prepare_backend_padding_metadata(
-                key_padding_mask,
-                ["real", "complex", "split"],
-                ["flash", "flash", "flex"],
-            )
+        schedules = (
+            (["real"], ["flash"]),
+            (["complex"], ["flash"]),
+            (["split"], ["flash"]),
+            (["dual"], ["flash"]),
+            (
+                ["real", "complex", "split", "dual"],
+                ["flash", "flash", "flash", "flash"],
+            ),
+        )
+        for spaces, backends in schedules:
+            with self.subTest(spaces=spaces), mock.patch(
+                "complex_attention.prepare_key_padding_mask",
+                return_value=sentinel,
+            ) as prepare:
+                actual = model_module._prepare_backend_padding_metadata(
+                    key_padding_mask,
+                    spaces,
+                    backends,
+                )
 
-        self.assertIs(actual, sentinel)
-        prepare.assert_called_once_with(key_padding_mask)
+            self.assertIs(actual, sentinel)
+            prepare.assert_called_once_with(key_padding_mask)
 
-    def test_split_flex_does_not_prepare_flash_padding_metadata(self):
+    def test_split_and_dual_flex_do_not_prepare_flash_padding_metadata(self):
         key_padding_mask = torch.tensor([[False, False, True, True]])
         with mock.patch("complex_attention.prepare_key_padding_mask") as prepare:
             actual = model_module._prepare_backend_padding_metadata(
                 key_padding_mask,
-                ["split"],
-                ["flex"],
+                ["split", "dual"],
+                ["flex", "flex"],
             )
 
         self.assertIsNone(actual)
@@ -761,6 +810,163 @@ class TestComplexAttentionIntegration(unittest.TestCase):
 
         self.assertIn("freqs_cis", dict(model.named_buffers()))
         self.assertNotIn("freqs_cis", model.state_dict())
+
+    def test_dual_adapter_applies_rope_and_forwards_flash_padding_metadata(self):
+        config = NeoBERTConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            hidden_act="gelu",
+            vocab_size=32,
+            max_length=4,
+            rope=True,
+            attention_spaces=["dual"],
+            attention_backends=["flash"],
+        )
+        attention = model_module.NeoBERTComplexAttention(
+            config,
+            attention_space="dual",
+            attention_backend="flash",
+        )
+        primal_qkv = torch.randn(1, 4, 24)
+        dual_qkv = torch.randn_like(primal_qkv)
+        frequencies = precompute_freqs_cis(config.dim_head, 4)
+        prepared_padding = object()
+        captured = {}
+
+        def fake_attention(query, key, value, **kwargs):
+            captured["query"] = query
+            captured["key"] = key
+            captured.update(kwargs)
+            return value, None
+
+        attention._dual_attention = fake_attention
+        with mock.patch.object(
+            attention.qkv,
+            "forward_real",
+            return_value=(primal_qkv, dual_qkv),
+        ):
+            output = attention(
+                torch.randn(1, 4, 8),
+                attn_mask=None,
+                key_padding_mask=torch.zeros(1, 4, dtype=torch.bool),
+                freqs_cis=frequencies,
+                prepared_key_padding_mask=prepared_padding,
+            )
+
+        self.assertEqual(output.shape, (1, 4, 8))
+        expected = []
+        for qkv in (primal_qkv, dual_qkv):
+            query, key, _ = qkv.view(1, 4, 2, 12).chunk(3, dim=-1)
+            expected.append(apply_rotary_emb(query, key, frequencies))
+        for component in range(2):
+            torch.testing.assert_close(
+                captured["query"][component],
+                expected[component][0].transpose(1, 2),
+            )
+            torch.testing.assert_close(
+                captured["key"][component],
+                expected[component][1].transpose(1, 2),
+            )
+        self.assertEqual(captured["backend"], "flash")
+        self.assertIs(captured["prepared_key_padding_mask"], prepared_padding)
+        self.assertIsNone(captured["block_mask"])
+
+    def test_dual_adapter_matches_explicit_product_rule_and_readout(self):
+        torch.manual_seed(2026)
+        config = NeoBERTConfig(
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            intermediate_size=8,
+            hidden_act="gelu",
+            vocab_size=16,
+            max_length=3,
+            rope=False,
+            attention_spaces=["dual"],
+            attention_backends=["torch"],
+        )
+        attention = model_module.NeoBERTComplexAttention(
+            config,
+            attention_space="dual",
+            attention_backend="torch",
+        ).double()
+        x = torch.randn(2, 3, 4, dtype=torch.float64)
+
+        qkv_primal = F.linear(x, attention.qkv.weight_primal)
+        qkv_dual = F.linear(x, attention.qkv.weight_dual)
+        q0, k0, v0 = (
+            component.transpose(1, 2)
+            for component in qkv_primal.view(2, 3, 1, 12).chunk(3, dim=-1)
+        )
+        q1, k1, v1 = (
+            component.transpose(1, 2)
+            for component in qkv_dual.view(2, 3, 1, 12).chunk(3, dim=-1)
+        )
+        scale = config.dim_head**-0.5
+        score0 = torch.matmul(q0, k0.transpose(-2, -1)) * scale
+        score1 = (
+            torch.matmul(q1, k0.transpose(-2, -1))
+            + torch.matmul(q0, k1.transpose(-2, -1))
+        ) * scale
+        probability0 = torch.softmax(score0, dim=-1)
+        probability1 = probability0 * (
+            score1 - (probability0 * score1).sum(dim=-1, keepdim=True)
+        )
+        output0 = torch.matmul(probability0, v0)
+        output1 = torch.matmul(probability0, v1) + torch.matmul(probability1, v0)
+        output0 = output0.transpose(1, 2).reshape(2, 3, 4)
+        output1 = output1.transpose(1, 2).reshape(2, 3, 4)
+        projected0 = F.linear(output0, attention.out_proj.weight_primal)
+        projected1 = F.linear(output1, attention.out_proj.weight_primal) + F.linear(
+            output0,
+            attention.out_proj.weight_dual,
+        )
+        expected = attention.readout[0] * projected0 + attention.readout[1] * projected1
+
+        actual = attention(x, None, None, None)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+
+    def test_dual_flex_adapter_drops_dense_padding_inputs(self):
+        config = NeoBERTConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            hidden_act="gelu",
+            vocab_size=32,
+            max_length=4,
+            rope=False,
+            attention_spaces=["dual"],
+            attention_backends=["flex"],
+        )
+        attention = model_module.NeoBERTComplexAttention(
+            config,
+            attention_space="dual",
+            attention_backend="flex",
+        )
+        captured = {}
+
+        def fake_attention(query, key, value, **kwargs):
+            captured.update(kwargs)
+            return value, None
+
+        attention._dual_attention = fake_attention
+        block_mask = object()
+        attention(
+            torch.randn(1, 4, 8),
+            attn_mask=torch.eye(4, dtype=torch.bool),
+            key_padding_mask=torch.zeros(1, 4, dtype=torch.bool),
+            freqs_cis=None,
+            block_mask=block_mask,
+            prepared_key_padding_mask=object(),
+        )
+
+        self.assertIsNone(captured["attn_mask"])
+        self.assertIsNone(captured["key_padding_mask"])
+        self.assertIsNone(captured["prepared_key_padding_mask"])
+        self.assertIs(captured["block_mask"], block_mask)
 
     def test_padding_bias_stays_compact(self):
         pad_mask = torch.tensor(
@@ -1085,11 +1291,11 @@ class TestComplexAttentionIntegration(unittest.TestCase):
                 config,
             )
 
-    def test_complex_projection_initialization_matches_real_energy(self):
+    def test_pair_projection_initialization_matches_real_energy(self):
         initialization_range = 0.02
         config = NeoBERTConfig(
             hidden_size=12,
-            num_hidden_layers=2,
+            num_hidden_layers=3,
             num_attention_heads=3,
             intermediate_size=24,
             hidden_act="gelu",
@@ -1097,15 +1303,17 @@ class TestComplexAttentionIntegration(unittest.TestCase):
             max_length=8,
             rope=False,
             decoder_init_range=initialization_range,
-            attention_spaces=["complex", "split"],
-            attention_backends=["torch", "torch"],
+            attention_spaces=["complex", "split", "dual"],
+            attention_backends=["torch", "torch", "torch"],
         )
         model = NeoBERT(config)
 
         complex_attention = model.transformer_encoder[0].complex_attention
         split_attention = model.transformer_encoder[1].complex_attention
+        dual_attention = model.transformer_encoder[2].complex_attention
         expected_pair_readout = torch.zeros_like(complex_attention.readout)
         expected_pair_readout[0].fill_(1.0)
+        expected_dual_readout = torch.ones_like(dual_attention.readout)
         torch.testing.assert_close(
             complex_attention.readout,
             expected_pair_readout,
@@ -1113,6 +1321,10 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         torch.testing.assert_close(
             split_attention.readout,
             expected_pair_readout,
+        )
+        torch.testing.assert_close(
+            dual_attention.readout,
+            expected_dual_readout,
         )
         pair_bound = initialization_range / math.sqrt(2.0)
         pair_weights = (
@@ -1127,6 +1339,15 @@ class TestComplexAttentionIntegration(unittest.TestCase):
         )
         for weight in pair_weights:
             self.assertLessEqual(weight.detach().abs().max().item(), pair_bound)
+        for projection in (dual_attention.qkv, dual_attention.out_proj):
+            self.assertLessEqual(
+                projection.weight_primal.detach().abs().max().item(),
+                pair_bound,
+            )
+            self.assertLessEqual(
+                projection.weight_dual.detach().abs().max().item(),
+                pair_bound,
+            )
 
 
 if __name__ == "__main__":

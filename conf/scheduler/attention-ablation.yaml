@@ -1,5 +1,5 @@
 # Same 6.51% warmup fraction as the completed 1,536-step pilot.
-warmup_steps: 2735
-decay_steps: 42000
+warmup_steps: 5469
+decay_steps: 84000
 decay: cosine
 final_ratio: 0.1

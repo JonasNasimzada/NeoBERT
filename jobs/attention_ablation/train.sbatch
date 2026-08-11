@@ -7,7 +7,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=ca-babylm-train-%A_%a.out
 
 set -euo pipefail
@@ -30,12 +30,12 @@ setup_attention_runtime
 
 DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-3h-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-1p376b-v1}"
 SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-$ATTENTION_TARGET_STEPS}"
 MICRO_BATCH="${MICRO_BATCH:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
-MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-10620}"
+MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-21240}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
 if [[ ! "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]]; then

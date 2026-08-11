@@ -168,6 +168,24 @@ def collect_metrics(
     return metrics, sources
 
 
+def collect_resource_metrics(path: Path) -> tuple[dict[str, float], dict[str, str]]:
+    """Read resource-monitor JSON under a stable BabyLM system namespace."""
+    resolved = path.resolve()
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot parse resource report {resolved}: {error}") from error
+    metrics: dict[str, float] = {}
+    sources: dict[str, str] = {}
+    for value_path, value in flatten_numeric_values(payload):
+        metric = "/".join((NAMESPACE, "system", *value_path))
+        if metric in metrics:
+            raise ValueError(f"normalized resource metric collision: {metric}")
+        metrics[metric] = value
+        sources[metric] = str(resolved)
+    return metrics, sources
+
+
 def _atomic_write_json(path: Path, payload: Mapping) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,6 +243,11 @@ def _log_to_wandb(metrics: Mapping[str, float], output: Path, args) -> None:
             "seed": args.seed,
             "results_root": str(args.results.resolve()),
             "metric_count": len(metrics),
+            "resource_report": (
+                str(args.resource_report.resolve())
+                if getattr(args, "resource_report", None) is not None
+                else None
+            ),
         },
     )
     try:
@@ -237,6 +260,11 @@ def _log_to_wandb(metrics: Mapping[str, float], output: Path, args) -> None:
         )
         artifact.add_dir(str(args.results.resolve()), name="official_results")
         artifact.add_file(str(output.resolve()), name="parsed_metrics.json")
+        if getattr(args, "resource_report", None) is not None:
+            artifact.add_file(
+                str(args.resource_report.resolve()),
+                name="resource_usage.json",
+            )
         run.log_artifact(artifact)
     finally:
         run.finish()
@@ -253,6 +281,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Experiment prefix used to isolate the resumable W&B run id",
     )
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--resource-report",
+        type=Path,
+        default=None,
+        help="Optional JSON emitted by run_with_resource_monitor.py",
+    )
     parser.add_argument("--project", default="complex-attention-ablation")
     parser.add_argument("--entity", default=os.environ.get("WANDB_ENTITY", ""))
     parser.add_argument("--group", default=None)
@@ -286,16 +320,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         exclude=args.output,
         max_file_bytes=args.max_file_bytes,
     )
+    if args.resource_report is not None:
+        resource_metrics, resource_sources = collect_resource_metrics(
+            args.resource_report
+        )
+        collisions = set(metrics).intersection(resource_metrics)
+        if collisions:
+            raise ValueError(
+                "resource metrics collide with evaluator results: "
+                + ", ".join(sorted(collisions))
+            )
+        metrics.update(resource_metrics)
+        sources.update(resource_sources)
     if not metrics and not args.allow_empty:
         raise RuntimeError(f"no numeric BabyLM metrics found under {args.results}")
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "babylm",
         "variant": args.variant,
         "seed": args.seed,
         "results_root": str(args.results.resolve()),
         "metric_count": len(metrics),
+        "resource_report": (
+            str(args.resource_report.resolve())
+            if args.resource_report is not None
+            else None
+        ),
         "metrics": metrics,
         "sources": sources,
     }

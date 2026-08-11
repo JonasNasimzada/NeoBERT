@@ -6,7 +6,7 @@ job_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 neobert_root="$(cd "$job_dir/../.." && pwd)"
 : "${DATASET_PATH:?Export DATASET_PATH before submitting the sweep.}"
 source "$job_dir/common.sh"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-3h-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-1p376b-v1}"
 SEED="${SEED:-42}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
@@ -17,6 +17,7 @@ export EXPERIMENT_ID RUNS_ROOT SEED
 # previous two-step smoke command remain in the caller's environment.  Direct
 # sbatch submissions can still override these values intentionally.
 unset MAX_STEPS WARMUP_STEPS CHECKPOINT_STEPS EVAL_STEPS LOG_INTERVAL MAX_TIME_SECONDS
+unset ATTENTION_PAPER_PROTOCOL
 
 # Keep the resource request explicit here as well as in the sbatch files so a
 # copied submission command retains the requested cluster contract.
@@ -45,7 +46,21 @@ benchmark_job_id="$(
 )"
 benchmark_job_id="${benchmark_job_id%%;*}"
 
+paper_benchmark_job_id="$(
+    sbatch --parsable \
+        --partition=slowlane \
+        --gpus=A100:1 \
+        --qos=hiwi_project \
+        --array=0-6 \
+        --chdir="$neobert_root" \
+        --export=ALL,NEOBERT_ROOT="$neobert_root" \
+        --dependency="aftercorr:$train_job_id" \
+        "$job_dir/benchmark_attention_papers.sbatch"
+)"
+paper_benchmark_job_id="${paper_benchmark_job_id%%;*}"
+
 echo "Training array:  $train_job_id"
-echo "Benchmark array: $benchmark_job_id (aftercorr:$train_job_id)"
+echo "Model benchmark: $benchmark_job_id (aftercorr:$train_job_id)"
+echo "Paper benchmark: $paper_benchmark_job_id (aftercorr:$train_job_id)"
 echo "Experiment id:   $EXPERIMENT_ID"
 echo "Experiment root: $RUNS_ROOT/$EXPERIMENT_ID"
