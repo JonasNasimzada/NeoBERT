@@ -41,8 +41,6 @@ VARIANTS = (
     Variant("complex_flash", "attention-ablation-complex.yaml", "complex", "flash"),
     Variant("split_native", "attention-ablation-split.yaml", "split", "native"),
     Variant("split_torch", "attention-ablation-split.yaml", "split", "torch"),
-    Variant("dual_native", "attention-ablation-dual.yaml", "dual", "native"),
-    Variant("dual_torch", "attention-ablation-dual.yaml", "dual", "torch"),
     Variant("real_torch", "attention-ablation-real.yaml", "real", "torch"),
     Variant("real_flash", "attention-ablation-real.yaml", "real", "flash"),
 )

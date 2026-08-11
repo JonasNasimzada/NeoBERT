@@ -29,4 +29,4 @@ wandb:
     - equal-parameters
   dir: ${oc.env:WANDB_DIR,logs/wandb}
   mode: ${oc.env:WANDB_MODE,online}
-  log_interval: 20
+  log_interval: 420

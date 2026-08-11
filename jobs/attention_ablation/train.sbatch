@@ -3,7 +3,7 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-8
+#SBATCH --array=0-6
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
@@ -32,10 +32,6 @@ DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyL
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
 EXPERIMENT_ID="${EXPERIMENT_ID:-a100-3h-v1}"
 SEED="${SEED:-42}"
-if [[ -z "${MAX_STEPS:-}" && -z "$ATTENTION_TARGET_STEPS" ]]; then
-    echo "$ATTENTION_VARIANT has no calibrated step budget; set MAX_STEPS explicitly." >&2
-    exit 2
-fi
 MAX_STEPS="${MAX_STEPS:-$ATTENTION_TARGET_STEPS}"
 MICRO_BATCH="${MICRO_BATCH:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-Usage: jobs/optibertneo-1p3b.sh {real|baseline|mixed}
+Usage: jobs/optibertneo-1p3b.sh {real|baseline}
 
 Launch this script once per node. For the paper's real-valued OptiBERTneo
 1.3B-token run, use "real" (the legacy alias "baseline" is identical).
@@ -35,12 +35,6 @@ case "$variant" in
         model_config=optibertneo-198m
         default_micro_batch=32
         default_accelerate_config=accelerate_ddp.yaml
-        ;;
-    mixed)
-        run_variant=mixed
-        model_config=optibertneo-mixed-198m
-        default_micro_batch=4
-        default_accelerate_config=accelerate_deepspeed_zero2.yaml
         ;;
     *)
         usage

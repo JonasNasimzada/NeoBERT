@@ -10,9 +10,6 @@ Slurm nodes with four H100 GPUs per node.
 > the former to 198M. This repository calls the model `real`; `baseline` is a
 > legacy alias for the same model.
 
-The complex/mixed model in this repository is a separate experiment and is
-out of scope for this runbook.
-
 ## Readiness status
 
 The configuration, preprocessing job, read-only preflight, NCCL smoke test,

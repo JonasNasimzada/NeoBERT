@@ -25,7 +25,7 @@ train_job_id="$(
         --partition=slowlane \
         --gpus=A100:1 \
         --qos=hiwi_project \
-        --array=0-8 \
+        --array=0-6 \
         --chdir="$neobert_root" \
         --export=ALL,NEOBERT_ROOT="$neobert_root" \
         "$job_dir/train.sbatch"
@@ -37,7 +37,7 @@ benchmark_job_id="$(
         --partition=slowlane \
         --gpus=A100:1 \
         --qos=hiwi_project \
-        --array=0-8 \
+        --array=0-6 \
         --chdir="$neobert_root" \
         --export=ALL,NEOBERT_ROOT="$neobert_root" \
         --dependency="aftercorr:$train_job_id" \

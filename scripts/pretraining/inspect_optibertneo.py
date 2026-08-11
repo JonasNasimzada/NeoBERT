@@ -10,7 +10,6 @@ from neobert.model import NeoBERTConfig, NeoBERTLMHead
 PAPER_NON_EMBEDDING_PARAMETERS = 12 * 768**2 * 28
 MODEL_CONFIGS = {
     "baseline": "optibertneo-198m.yaml",
-    "mixed": "optibertneo-mixed-198m.yaml",
 }
 
 
@@ -45,7 +44,7 @@ def inspect_variant(variant):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("variant", choices=("baseline", "mixed", "all"), default="all", nargs="?")
+    parser.add_argument("variant", choices=("baseline", "all"), default="all", nargs="?")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 

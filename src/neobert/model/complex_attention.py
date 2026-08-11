@@ -37,10 +37,8 @@ class NeoBERTComplexAttention(nn.Module):
         try:
             from complex_attention import (
                 ComplexLinear,
-                DualLinear,
                 SplitComplexLinear,
                 complex_attention,
-                dual_attention,
                 split_complex_attention,
             )
         except ImportError as error:
@@ -56,7 +54,6 @@ class NeoBERTComplexAttention(nn.Module):
         self.attention_dropout = float(getattr(config, "attention_dropout", 0.0))
         self._complex_attention = complex_attention
         self._split_attention = split_complex_attention
-        self._dual_attention = dual_attention
 
         if self.space == "complex":
             self.qkv = ComplexLinear(config.hidden_size, config.hidden_size * 3, bias=False)
@@ -68,12 +65,6 @@ class NeoBERTComplexAttention(nn.Module):
             self.out_proj = SplitComplexLinear(config.hidden_size, config.hidden_size, bias=False)
             readout = torch.zeros(2, config.hidden_size)
             readout[0].fill_(1.0)
-        elif self.space == "dual":
-            self.qkv = DualLinear(config.hidden_size, config.hidden_size * 3, bias=False)
-            self.out_proj = DualLinear(config.hidden_size, config.hidden_size, bias=False)
-            readout = torch.zeros(2, config.hidden_size)
-            readout[0].fill_(1.0)
-            readout[1].fill_(1.0)
         else:
             raise ValueError(f"unsupported complex attention space: {self.space}")
         self.readout = nn.Parameter(readout)
@@ -93,18 +84,9 @@ class NeoBERTComplexAttention(nn.Module):
                 for layer in layers:
                     layer.weight_real.uniform_(-bound, bound)
                     layer.weight_split.uniform_(-bound, bound)
-        else:
-            bound = initialization_range / math.sqrt(2.0)
-            layers = (self.qkv, self.out_proj)
-            with torch.no_grad():
-                for layer in layers:
-                    layer.weight_primal.uniform_(-bound, bound)
-                    layer.weight_dual.uniform_(-bound, bound)
         with torch.no_grad():
             self.readout.zero_()
             self.readout[0].fill_(1.0)
-            if self.space == "dual":
-                self.readout[1].fill_(1.0)
 
     def _complex_forward(
         self,
@@ -177,43 +159,6 @@ class NeoBERTComplexAttention(nn.Module):
         output = (_from_attention_layout(output[0]), _from_attention_layout(output[1]))
         return self.out_proj.forward_readout(output, self.readout)
 
-    def _dual_forward(
-        self,
-        x: Tensor,
-        attn_mask: Optional[Tensor],
-        key_padding_mask: Optional[Tensor],
-        freqs_cis: Optional[Tensor],
-        block_mask: Any,
-    ) -> Tensor:
-        qkv_primal, qkv_dual = self.qkv.forward_real(x)
-        primal_parts = _reshape_qkv(qkv_primal, self.num_heads, self.head_dim)
-        dual_parts = _reshape_qkv(qkv_dual, self.num_heads, self.head_dim)
-        query = primal_parts[0], dual_parts[0]
-        key = primal_parts[1], dual_parts[1]
-        value = primal_parts[2], dual_parts[2]
-        if self.rope:
-            query, key = _apply_pair_rope(query, key, freqs_cis)
-
-        query = tuple(_to_attention_layout(component) for component in query)
-        key = tuple(_to_attention_layout(component) for component in key)
-        value = tuple(_to_attention_layout(component) for component in value)
-        uses_block_mask = self.backend == "flex" and block_mask is not None
-        direct_mask = None if uses_block_mask else attn_mask
-        direct_key_padding = None if uses_block_mask else key_padding_mask
-        output, _ = self._dual_attention(
-            query,
-            key,
-            value,
-            attn_mask=direct_mask,
-            key_padding_mask=direct_key_padding,
-            scale=self.head_dim**-0.5,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            backend=self.backend,
-            block_mask=block_mask if self.backend == "flex" else None,
-        )
-        output = tuple(_from_attention_layout(component) for component in output)
-        return self.out_proj.forward_readout(output, self.readout)
-
     def forward(
         self,
         x: Tensor,
@@ -242,19 +187,11 @@ class NeoBERTComplexAttention(nn.Module):
                 block_mask,
                 prepared_key_padding_mask,
             )
-        if self.space == "split":
-            return self._split_forward(
-                x,
-                attn_mask,
-                key_padding_mask,
-                freqs_cis,
-                block_mask,
-                prepared_key_padding_mask,
-            )
-        return self._dual_forward(
+        return self._split_forward(
             x,
             attn_mask,
             key_padding_mask,
             freqs_cis,
             block_mask,
+            prepared_key_padding_mask,
         )

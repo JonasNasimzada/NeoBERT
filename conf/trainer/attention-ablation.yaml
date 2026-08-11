@@ -3,9 +3,8 @@ mixed_precision: bf16
 resume: true
 disable_tqdm: false
 
-# Local fallback only. The Slurm sweep supplies a backend-calibrated step cap
-# so every A100 task runs for approximately the same wall-clock budget.
-max_steps: 1536
+# 42,000 * 32 packed sequences/update * 512 = 688,128,000 token positions.
+max_steps: 42000
 gradient_accumulation_steps: 4
 gradient_clipping: 1.0
 
@@ -15,24 +14,21 @@ gradient_clipping: 1.0
 max_time_seconds: 10620
 
 # Compilation is intentionally disabled for the first controlled sweep. The
-# custom native operators and torch.func.jvp path should be measured directly.
+# custom native operators should be measured directly.
 compile: false
 compile_fullgraph: false
 find_unused_parameters: false
 
 validation:
-  # Local fallback; train.sbatch scales this to about six evaluations per run.
-  eval_steps: 256
+  eval_steps: 7000
   max_batches: 32
   seed: 314159
 
 accelerate:
-  # Local fallback; train.sbatch scales this to about six checkpoints per run.
-  save_steps: 256
+  save_steps: 7000
   max_ckpt: 3
 model:
-  # Local fallback; train.sbatch scales this to about six checkpoints per run.
-  save_steps: 256
+  save_steps: 7000
   max_ckpt: 7
   save_at_end: true
   export_at_end: true

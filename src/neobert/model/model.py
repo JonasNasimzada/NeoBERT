@@ -278,9 +278,6 @@ class NeoBERTConfig(PretrainedConfig):
         fused_swiglu: bool = True,
         **kwargs,
     ):
-        # Ignore the removed dual-attention JVP chunking option when loading an
-        # older checkpoint or Hydra configuration.
-        kwargs.pop("dual_tangent_chunk_size", None)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
         if hidden_size <= 0:
@@ -316,16 +313,15 @@ class NeoBERTConfig(PretrainedConfig):
         if flash_attention is not None and not isinstance(flash_attention, bool):
             raise ValueError("flash_attention must be a bool or None")
         self.flash_attention = flash_attention
-        valid_spaces = ("real", "complex", "split", "dual")
+        valid_spaces = ("real", "complex", "split")
         valid_backends = ("auto", "native", "torch", "flash", "flex")
         supported_backends = {
             "real": ("auto", "torch", "flash", "flex"),
             "complex": ("auto", "native", "torch", "flash", "flex"),
             "split": ("auto", "native", "torch", "flex"),
-            "dual": ("auto", "native", "torch", "flex"),
         }
         if attention_space not in valid_spaces:
-            raise ValueError("attention_space must be 'real', 'complex', 'split', or 'dual'")
+            raise ValueError("attention_space must be 'real', 'complex', or 'split'")
         if attention_backend not in valid_backends:
             raise ValueError(
                 "attention_backend must be 'auto', 'native', 'torch', 'flash', or 'flex'"
@@ -355,7 +351,6 @@ class NeoBERTConfig(PretrainedConfig):
                     "real": "real",
                     "complex": "ordinary complex",
                     "split": "split-complex",
-                    "dual": "dual-number",
                 }[layer_space]
                 allowed = supported_backends[layer_space]
                 raise ValueError(

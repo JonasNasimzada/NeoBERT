@@ -24,7 +24,6 @@ PyTorch. Attention backends are selected per scalar space:
 | Real | `auto`, `torch`, `flash`, `flex` |
 | Ordinary complex | `auto`, `native`, `torch`, `flash`, `flex` |
 | Split complex | `auto`, `native`, `torch`, `flex` |
-| Dual number | `auto`, `native`, `torch`, `flex` |
 
 The legacy `flash_attention` flag maps `true` to `flash` and `false` to
 `torch`. Packed-document schedules should use `flex`; direct `flash` does not

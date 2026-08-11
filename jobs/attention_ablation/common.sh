@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
-# Shared helpers for the calibrated nine-way ablation and the explicitly
-# budgeted, uncalibrated dual-number FlexAttention variant at index 9.
+# Shared helpers for the calibrated seven-way attention ablation.
 
 ATTENTION_VARIANTS=(
     complex-native
@@ -9,59 +8,36 @@ ATTENTION_VARIANTS=(
     complex-flash
     split-native
     split-torch
-    dual-native
-    dual-torch
     real-torch
     real-flash
-    dual-flex
 )
-ATTENTION_SPACES=(complex complex complex split split dual dual real real dual)
-ATTENTION_BACKENDS=(native torch flash native torch native torch torch flash flex)
+ATTENTION_SPACES=(complex complex complex split split real real)
+ATTENTION_BACKENDS=(native torch flash native torch torch flash)
 MODEL_CONFIGS=(
     attention-ablation-complex
     attention-ablation-complex
     attention-ablation-complex
     attention-ablation-split
     attention-ablation-split
-    attention-ablation-dual
-    attention-ablation-dual
     attention-ablation-real
     attention-ablation-real
-    attention-ablation-dual
 )
 
-# Backend-specific optimizer-step ceilings calibrated from the completed A100
-# pilot array (job 44088). Each target represents roughly 10,400 seconds of
-# optimizer work; setup, six validations/checkpoints, and final export bring
-# the end-to-end task close to the three-hour Slurm allocation. Faster
-# backends intentionally receive more steps and therefore see more tokens.
-# The dual-native and dual-torch values predate the real dual-number migration;
-# remeasure them before treating a new sweep as equal-time evidence.
-# Dual FlexAttention is intentionally uncalibrated and therefore has no target.
-ATTENTION_TARGET_STEP_COUNTS=(
-    95000   # complex-native
-    113500  # complex-torch
-    96000   # complex-flash
-    66500   # split-native
-    89000   # split-torch
-    52000   # dual-native
-    42000   # dual-torch
-    156000  # real-torch
-    153000  # real-flash
-    ""      # dual-flex (explicit MAX_STEPS required)
-)
+# Equal-step/equal-token budget for the controlled seven-way sweep. At effective
+# batch 32 and context 512, every model sees 688,128,000 token positions.
+ATTENTION_EQUAL_TOKEN_STEPS=42000
 
 resolve_attention_variant() {
     local task_id="${1:?array task id is required}"
-    if [[ ! "$task_id" =~ ^[0-9]$ ]]; then
-        echo "Array task id must be an integer from 0 through 9; got '$task_id'." >&2
+    if [[ ! "$task_id" =~ ^[0-6]$ ]]; then
+        echo "Array task id must be an integer from 0 through 6; got '$task_id'." >&2
         return 2
     fi
     ATTENTION_VARIANT="${ATTENTION_VARIANTS[$task_id]}"
     ATTENTION_SPACE="${ATTENTION_SPACES[$task_id]}"
     ATTENTION_BACKEND="${ATTENTION_BACKENDS[$task_id]}"
     MODEL_CONFIG="${MODEL_CONFIGS[$task_id]}"
-    ATTENTION_TARGET_STEPS="${ATTENTION_TARGET_STEP_COUNTS[$task_id]}"
+    ATTENTION_TARGET_STEPS="$ATTENTION_EQUAL_TOKEN_STEPS"
     export ATTENTION_VARIANT ATTENTION_SPACE ATTENTION_BACKEND MODEL_CONFIG
     export ATTENTION_TARGET_STEPS
 }
@@ -117,9 +93,11 @@ setup_attention_runtime() {
     # both Conda and user-site packages for its pinned Python training stack.
     unset PYTHONNOUSERSITE
     export PYTHONPATH="$NEOBERT_ROOT/src:$COMPLEX_ATTENTION_ROOT${CUSTOM_TORCH_PYTHONPATH:+:$CUSTOM_TORCH_PYTHONPATH}${PYTHONPATH:+:$PYTHONPATH}"
-    if [[ -d "$COMPLEX_ATTENTION_ROOT/pytorch/torch/lib" ]]; then
-        export LD_LIBRARY_PATH="$COMPLEX_ATTENTION_ROOT/pytorch/torch/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    fi
+
+    # The editable PyTorch install loads its extension and matching libraries
+    # from attention_dev. Do not prepend pytorch/torch/lib here: that directory
+    # can contain artifacts from an older source revision and can poison child
+    # extension linkers even though torch._C itself has an $ORIGIN/lib RPATH.
 
     cache_root="${SLURM_TMPDIR:-/tmp}/complex-attention-${SLURM_JOB_ID:-manual}-${SLURM_ARRAY_TASK_ID:-0}"
     mkdir -p "$cache_root/triton" "$cache_root/inductor" "$cache_root/cuda"

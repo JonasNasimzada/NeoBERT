@@ -15,7 +15,6 @@ VALID_BACKENDS = {
     "real": {"torch", "flash"},
     "complex": {"native", "torch", "flash"},
     "split": {"native", "torch"},
-    "dual": {"native", "torch", "flex"},
 }
 
 
