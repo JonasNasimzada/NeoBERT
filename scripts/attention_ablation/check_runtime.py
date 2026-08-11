@@ -14,7 +14,8 @@ from neobert.model import NeoBERTConfig, NeoBERTLMHead
 VALID_BACKENDS = {
     "real": {"torch", "flash"},
     "complex": {"native", "torch", "flash"},
-    "split": {"native", "torch"},
+    "split": {"native", "torch", "flash"},
+    "dual": {"native", "torch", "flash"},
 }
 
 

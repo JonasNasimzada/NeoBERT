@@ -1,6 +1,6 @@
 # Equal-parameter, equal-token attention-space ablation
 
-This recipe trains seven homogeneous masked-language models on BabyLM 2026
+This recipe trains eleven homogeneous masked-language models on BabyLM 2026
 Strict. Every encoder layer in a model uses exactly one attention
 space/backend pair.
 
@@ -13,6 +13,14 @@ space/backend pair.
 | 4 | split complex | torch | 2,049 | 17,260,288 |
 | 5 | real | torch | 2,562 | 17,260,288 |
 | 6 | real | flash | 2,562 | 17,260,288 |
+| 7 | split complex | flash | 2,049 | 17,260,288 |
+| 8 | dual number | native | 2,049 | 17,260,288 |
+| 9 | dual number | torch | 2,049 | 17,260,288 |
+| 10 | dual number | flash (hybrid tangent) | 2,049 | 17,260,288 |
+
+Ids 0 through 6 remain unchanged so existing checkpoint paths and submitted
+array tasks keep their original meaning. The new split-Flash and dual variants
+are appended at ids 7 through 10.
 
 All models otherwise use 6 layers, width 256, 8 heads, GELU, RoPE, pre-RMSNorm,
 tied input/output embeddings, no bias in the MLM head, and no dropout. The
@@ -28,13 +36,13 @@ wider 2,562-unit FFN to keep the layer and model totals identical.
 The preprocessing job concatenates tokenized documents and writes exact
 512-token rows. It drops only the final incomplete tail, so training has no
 padding or unpadding overhead. The same packed rows and deterministic split are
-used by all seven models.
+used by all eleven models.
 
 The rows intentionally do **not** contain `document_ids`. Direct Flash SDPA
-cannot represent NeoBERT's block-diagonal document mask. Consequently all seven
+cannot represent NeoBERT's block-diagonal document mask. Consequently all eleven
 runs allow attention across document boundaries inside a packed row. This is
-the controlled seven-way comparison that includes `complex/flash` and
-`real/flash` without changing the attention semantics for those runs. If
+the controlled eleven-way comparison that includes every direct-Flash variant
+without changing the attention semantics for those runs. If
 document boundaries must be isolated, use FlexAttention and treat that as a
 separate experiment; do not label it `flash`.
 
@@ -55,9 +63,11 @@ The common training configuration is:
   points every 14,000 steps.
 
 One step always contains 32 packed sequences, or 16,384 token positions. All
-seven variants therefore run the same number of updates and see the same token
-budget. Doubling the original 42,000-step calibration makes the slowest backend
-an approximately six-hour run; faster backends finish earlier. Keeping a
+eleven variants therefore run the same number of updates and see the same token
+budget. Doubling the original 42,000-step calibration makes the previously
+calibrated slowest backend an approximately six-hour run; faster backends finish
+earlier. The dual-Flash hybrid is new and uncalibrated, so its dense tangent may
+hit the six-hour guard before step 84,000. Keeping a
 finished fast job idle would not train it further or improve the comparison.
 
 A 21,240-second emergency guard leaves about six minutes before Slurm
@@ -129,7 +139,7 @@ The validator resolves the local NeoBERT and ComplexAttention source trees
 itself; it does not require an editable NeoBERT installation or a manual
 `PYTHONPATH`.
 
-Before the full run, launch a two-step seven-way A100 smoke array:
+Before the full run, launch a two-step eleven-way A100 smoke array:
 
 ```bash
 export SMOKE_RUNS_ROOT=/shared/path/complex-attention-ablation-smoke
@@ -137,14 +147,14 @@ sbatch \
   --partition=slowlane \
   --gpus=A100:1 \
   --qos=hiwi_project \
-  --array=0-6 \
+  --array=0-10 \
   --time=00:20:00 \
   --export=ALL,RUNS_ROOT="$SMOKE_RUNS_ROOT",EXPERIMENT_ID=smoke-v1,MAX_STEPS=2,WARMUP_STEPS=1,WANDB_MODE=disabled \
   jobs/attention_ablation/train.sbatch
 ```
 
-To smoke-test only the two real-valued additions, use the same command with
-`--array=5-6`.
+To smoke-test only the two newly added Flash paths, use the same command with
+`--array=7,10`. To test all dual-number implementations, use `--array=8-10`.
 
 Set W&B and output locations, then submit the training array and its two
 correlated benchmark arrays:
@@ -162,7 +172,7 @@ bash jobs/attention_ablation/submit.sh
 The submission script uses the requested resource command for all arrays:
 
 ```text
-sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-6 ...
+sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-10 ...
 ```
 
 Each training task first checks for an A100, SM80 code, BF16 support, and a
@@ -209,6 +219,14 @@ the paper's padding mask are marked unsupported instead of silently switching
 backend. CUDA allocator peaks are memory footprint measurements, not the HBM
 traffic counter reported by profiler-based figures in the first paper.
 
+Split-complex Flash is one strict packed Flash SDPA call for both idempotent
+channels. Dual-number Flash is deliberately reported as a hybrid: strict Flash
+computes the primal, while an exact dense analytic calculation computes the
+tangent. Its measured time and peak memory include that dense tangent, so it
+does not have FlashAttention's linear-memory scaling and long rows may report
+OOM. The FA1 padding rows and split/dual Flash dropout rows are explicitly
+`unsupported`, never relabeled fallbacks.
+
 For the official BabyLM zero-shot suite, prepare and pin a checkout of
 `babylm-org/babylm-eval`, download its evaluation data (including any gated
 assets), and export `BABYLM_EVAL_ROOT` before submission. The benchmark job will
@@ -223,13 +241,13 @@ interval defaults to 0.25 seconds and can be set with
 `BENCHMARK_MEMORY_SAMPLE_INTERVAL`.
 
 The official harness pads variable-length MLM batches. For strict
-`complex/flash` and `real/flash` checkpoints, a scoped evaluator-only adapter
+Flash checkpoints, a scoped evaluator-only adapter
 runs each padded row at its true length and restores batch-shaped logits. This
 preserves the selected Flash backend and avoids silently falling back to Torch
 SDPA.
 
 The `torch` variants permit PyTorch's normal SDPA selection and may themselves
 choose a Flash kernel on A100; the `flash` variants strictly select PyTorch's
-Flash SDPA backend. They do not require the external `flash-attn` package.
-Treat the corresponding torch/flash pairs as equivalent implementations and
-use the runtime/memory logs to distinguish dispatch behavior.
+Flash SDPA backend for their Flash-capable core. They do not require the
+external `flash-attn` package. The dual-Flash qualifier above is essential:
+only its primal is Flash, while its tangent remains dense.

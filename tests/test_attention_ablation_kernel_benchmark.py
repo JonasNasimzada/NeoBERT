@@ -38,8 +38,12 @@ class TestPaperProtocols(unittest.TestCase):
         fa1 = [case for case in cases if case.protocol == "fa1-e6"]
         fa2 = [case for case in cases if case.protocol == "fa2-4.1"]
 
-        self.assertEqual(len(fa1), 7 * 10 * 2 * 2)
-        self.assertEqual(len(fa2), 7 * 2 * 6 * 2)
+        self.assertEqual(len(fa1), 11 * 10 * 2 * 2)
+        self.assertEqual(len(fa2), 11 * 2 * 6 * 2)
+        self.assertEqual(
+            {case.variant for case in cases},
+            set(benchmark.DEFAULT_VARIANTS),
+        )
         self.assertEqual(
             sorted({case.sequence_length for case in fa1}),
             list(benchmark.FA1_SEQUENCE_LENGTHS),
@@ -127,6 +131,28 @@ class TestPaperProtocols(unittest.TestCase):
         with self.assertRaisesRegex(benchmark.UnsupportedCase, "key-padding"):
             benchmark._attention_callable(case)
 
+    def test_split_and_dual_flash_dropout_are_explicitly_unsupported(self):
+        for variant in ("split-flash", "dual-flash"):
+            with self.subTest(variant=variant):
+                case = benchmark.BenchmarkCase(
+                    protocol="fa1-e6",
+                    variant=variant,
+                    batch_size=16,
+                    heads=8,
+                    sequence_length=128,
+                    head_dim=64,
+                    causal=False,
+                    padding_mask=False,
+                    dropout_p=0.1,
+                    repetitions=1,
+                    warmup_repetitions=1,
+                )
+                with self.assertRaisesRegex(
+                    benchmark.UnsupportedCase,
+                    "shared dropout",
+                ):
+                    benchmark._attention_callable(case)
+
 
 class TestAccounting(unittest.TestCase):
     def make_case(self, *, variant="real-torch", causal=False):
@@ -180,6 +206,14 @@ class TestAccounting(unittest.TestCase):
             complex_row["backend_target"],
             "pytorch-sdpa-auto-packed-complex",
         )
+        split_flash = benchmark._base_row(
+            self.make_case(variant="split-flash"), element_size=2
+        )
+        dual_flash = benchmark._base_row(
+            self.make_case(variant="dual-flash"), element_size=2
+        )
+        self.assertIn("one-packed-split-complex", split_flash["backend_target"])
+        self.assertIn("dense-analytic-tangent", dual_flash["backend_target"])
         self.assertIsNone(real["backend_effective"])
 
     def test_token_rates_use_batch_times_sequence_for_each_phase(self):

@@ -28,7 +28,7 @@ SPEC.loader.exec_module(validator)
 
 
 class TestAttentionAblationVariants(unittest.TestCase):
-    def test_exact_seven_variant_matrix_is_parameter_matched(self):
+    def test_exact_eleven_variant_matrix_is_parameter_matched(self):
         self.assertEqual(
             [
                 (variant.attention_space, variant.attention_backend)
@@ -42,12 +42,16 @@ class TestAttentionAblationVariants(unittest.TestCase):
                 ("split", "torch"),
                 ("real", "torch"),
                 ("real", "flash"),
+                ("split", "flash"),
+                ("dual", "native"),
+                ("dual", "torch"),
+                ("dual", "flash"),
             ],
         )
 
         counts = validator.validate_variants(verbose=False)
 
-        self.assertEqual(len(counts), 7)
+        self.assertEqual(len(counts), 11)
         self.assertEqual(
             set(counts.values()),
             {validator.EXPECTED_TRAINABLE_PARAMETERS},
@@ -57,7 +61,7 @@ class TestAttentionAblationVariants(unittest.TestCase):
         common_path = NEOBERT_ROOT / "jobs" / "attention_ablation" / "common.sh"
         command = r'''
 source "$1"
-for task_id in {0..6}; do
+for task_id in {0..10}; do
     resolve_attention_variant "$task_id"
     printf '%s:%s:%s:%s\n' \
         "$ATTENTION_VARIANT" \
@@ -82,6 +86,10 @@ done
                 "split-torch:split:torch:84000",
                 "real-torch:real:torch:84000",
                 "real-flash:real:flash:84000",
+                "split-flash:split:flash:84000",
+                "dual-native:dual:native:84000",
+                "dual-torch:dual:torch:84000",
+                "dual-flash:dual:flash:84000",
             ],
         )
 

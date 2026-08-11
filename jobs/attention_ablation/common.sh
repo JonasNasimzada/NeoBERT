@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Shared helpers for the calibrated seven-way attention ablation.
+# Shared helpers for the controlled eleven-way attention ablation.
 
 ATTENTION_VARIANTS=(
     complex-native
@@ -10,9 +10,13 @@ ATTENTION_VARIANTS=(
     split-torch
     real-torch
     real-flash
+    split-flash
+    dual-native
+    dual-torch
+    dual-flash
 )
-ATTENTION_SPACES=(complex complex complex split split real real)
-ATTENTION_BACKENDS=(native torch flash native torch torch flash)
+ATTENTION_SPACES=(complex complex complex split split real real split dual dual dual)
+ATTENTION_BACKENDS=(native torch flash native torch torch flash flash native torch flash)
 MODEL_CONFIGS=(
     attention-ablation-complex
     attention-ablation-complex
@@ -21,16 +25,20 @@ MODEL_CONFIGS=(
     attention-ablation-split
     attention-ablation-real
     attention-ablation-real
+    attention-ablation-split
+    attention-ablation-dual
+    attention-ablation-dual
+    attention-ablation-dual
 )
 
-# Equal-step/equal-token budget for the controlled seven-way sweep. At effective
+# Equal-step/equal-token budget for the controlled eleven-way sweep. At effective
 # batch 32 and context 512, every model sees 1,376,256,000 token positions.
 ATTENTION_EQUAL_TOKEN_STEPS=84000
 
 resolve_attention_variant() {
     local task_id="${1:?array task id is required}"
-    if [[ ! "$task_id" =~ ^[0-6]$ ]]; then
-        echo "Array task id must be an integer from 0 through 6; got '$task_id'." >&2
+    if [[ ! "$task_id" =~ ^([0-9]|10)$ ]]; then
+        echo "Array task id must be an integer from 0 through 10; got '$task_id'." >&2
         return 2
     fi
     ATTENTION_VARIANT="${ATTENTION_VARIANTS[$task_id]}"

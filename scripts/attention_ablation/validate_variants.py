@@ -43,6 +43,12 @@ VARIANTS = (
     Variant("split_torch", "attention-ablation-split.yaml", "split", "torch"),
     Variant("real_torch", "attention-ablation-real.yaml", "real", "torch"),
     Variant("real_flash", "attention-ablation-real.yaml", "real", "flash"),
+    # Keep the original array ids stable and append the requested strict Flash
+    # implementations plus the already requested dual native/Torch controls.
+    Variant("split_flash", "attention-ablation-split.yaml", "split", "flash"),
+    Variant("dual_native", "attention-ablation-dual.yaml", "dual", "native"),
+    Variant("dual_torch", "attention-ablation-dual.yaml", "dual", "torch"),
+    Variant("dual_flash", "attention-ablation-dual.yaml", "dual", "flash"),
 )
 
 

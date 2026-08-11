@@ -3,7 +3,7 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-6
+#SBATCH --array=0-10
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -79,7 +79,7 @@ if [[ -n "${BABYLM_EVAL_ROOT:-}" ]]; then
 
     # The official evaluator keys its output by the model path's basename.
     # Every training export is named final_model, so give each array task a
-    # unique, scoped symlink to avoid seven concurrent jobs colliding.
+    # unique, scoped symlink to avoid concurrent array tasks colliding.
     official_model_name="hf-$EXPERIMENT_ID-$ATTENTION_VARIANT-seed-$SEED"
     official_model_path="$BENCHMARK_ROOT/$official_model_name"
     resource_report="$BENCHMARK_ROOT/babylm_resource_usage.json"

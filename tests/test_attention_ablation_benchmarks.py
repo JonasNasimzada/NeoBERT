@@ -56,7 +56,7 @@ padding_free_flash = load_flash_adapter()
 
 
 class TestVariantMatrix(unittest.TestCase):
-    def test_real_variants_are_canonicalized_and_registered(self):
+    def test_flash_variants_are_canonicalized_and_registered(self):
         self.assertEqual(benchmark_mlm.canonical_variant("real_torch"), "real-torch")
         self.assertEqual(benchmark_mlm.canonical_variant("REAL-FLASH"), "real-flash")
         self.assertEqual(
@@ -66,6 +66,38 @@ class TestVariantMatrix(unittest.TestCase):
         self.assertEqual(
             benchmark_mlm.VARIANT_MATRIX["real-flash"],
             ("real", "flash"),
+        )
+        self.assertEqual(
+            benchmark_mlm.canonical_variant("SPLIT_FLASH"),
+            "split-flash",
+        )
+        self.assertEqual(
+            benchmark_mlm.VARIANT_MATRIX["split-flash"],
+            ("split", "flash"),
+        )
+        self.assertEqual(
+            benchmark_mlm.canonical_variant("DUAL_FLASH"),
+            "dual-flash",
+        )
+        self.assertEqual(
+            benchmark_mlm.VARIANT_MATRIX["dual-flash"],
+            ("dual", "flash"),
+        )
+        self.assertEqual(
+            set(benchmark_mlm.VARIANT_MATRIX),
+            {
+                "complex-native",
+                "complex-torch",
+                "complex-flash",
+                "split-native",
+                "split-torch",
+                "real-torch",
+                "real-flash",
+                "split-flash",
+                "dual-native",
+                "dual-torch",
+                "dual-flash",
+            },
         )
 
     def test_heldout_token_budget_is_doubled(self):

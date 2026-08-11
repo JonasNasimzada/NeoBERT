@@ -3,7 +3,7 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-6
+#SBATCH --array=0-10
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12

@@ -39,9 +39,12 @@ DEFAULT_VARIANTS = (
     "split-torch",
     "real-torch",
     "real-flash",
+    "split-flash",
+    "dual-native",
+    "dual-torch",
+    "dual-flash",
 )
-OPTIONAL_VARIANTS = ("dual-native", "dual-torch")
-ALL_VARIANTS = DEFAULT_VARIANTS + OPTIONAL_VARIANTS
+ALL_VARIANTS = DEFAULT_VARIANTS
 
 PROTOCOL_METADATA = {
     "fa1-e6": {
@@ -96,7 +99,6 @@ class VariantSpec:
     backend: str
     physical_components: int
     logical_algebra_multiplier: float
-    optional: bool = False
 
 
 VARIANT_SPECS = {
@@ -105,10 +107,12 @@ VARIANT_SPECS = {
     "complex-flash": VariantSpec("ordinary_complex", "flash", 2, 2.0),
     "split-native": VariantSpec("split_complex", "native", 2, 2.0),
     "split-torch": VariantSpec("split_complex", "torch", 2, 2.0),
+    "split-flash": VariantSpec("split_complex", "flash", 2, 2.0),
     "real-torch": VariantSpec("real", "torch", 1, 1.0),
     "real-flash": VariantSpec("real", "flash", 1, 1.0),
-    "dual-native": VariantSpec("dual_number", "native", 2, 3.0, optional=True),
-    "dual-torch": VariantSpec("dual_number", "torch", 2, 3.0, optional=True),
+    "dual-native": VariantSpec("dual_number", "native", 2, 3.0),
+    "dual-torch": VariantSpec("dual_number", "torch", 2, 3.0),
+    "dual-flash": VariantSpec("dual_number", "flash", 2, 3.0),
 }
 BACKEND_TARGETS = {
     "complex-native": "pytorch-sdpa-math-packed-complex",
@@ -116,10 +120,12 @@ BACKEND_TARGETS = {
     "complex-flash": "pytorch-sdpa-flash-packed-complex",
     "split-native": "custom-aten-split-complex",
     "split-torch": "pytorch-sdpa-auto-two-split-channels",
+    "split-flash": "pytorch-sdpa-flash-one-packed-split-complex-call",
     "real-torch": "pytorch-sdpa-auto",
     "real-flash": "pytorch-sdpa-flash",
     "dual-native": "custom-aten-dual-number",
     "dual-torch": "pytorch-jvp-sdpa",
+    "dual-flash": "pytorch-sdpa-flash-primal-plus-dense-analytic-tangent",
 }
 
 
@@ -401,6 +407,15 @@ def _attention_callable(case: BenchmarkCase) -> Callable[[Any, Any, Any, Tensor 
         raise UnsupportedCase(
             "strict FlashAttention does not accept key-padding masks; the row is "
             "reported as unsupported instead of falling back to another backend"
+        )
+    if (
+        spec.backend == "flash"
+        and case.dropout_p
+        and spec.algebra in ("split_complex", "dual_number")
+    ):
+        raise UnsupportedCase(
+            f"{spec.algebra} FlashAttention cannot preserve one shared dropout "
+            "sample across both components; this row is explicitly unsupported"
         )
 
     if spec.algebra == "real":
