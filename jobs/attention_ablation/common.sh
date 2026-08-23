@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Shared helpers for the controlled eleven-way attention ablation.
+# Shared helpers for the controlled twelve-way attention ablation.
 
 ATTENTION_VARIANTS=(
     complex-native
@@ -14,9 +14,10 @@ ATTENTION_VARIANTS=(
     dual-native
     dual-torch
     dual-flash
+    dual-flash-fused
 )
-ATTENTION_SPACES=(complex complex complex split split real real split dual dual dual)
-ATTENTION_BACKENDS=(native torch flash native torch torch flash flash native torch flash)
+ATTENTION_SPACES=(complex complex complex split split real real split dual dual dual dual)
+ATTENTION_BACKENDS=(native torch flash native torch torch flash flash native torch flash flash_fused)
 MODEL_CONFIGS=(
     attention-ablation-complex
     attention-ablation-complex
@@ -29,16 +30,27 @@ MODEL_CONFIGS=(
     attention-ablation-dual
     attention-ablation-dual
     attention-ablation-dual
+    attention-ablation-dual
 )
 
-# Equal-step/equal-token budget for the controlled eleven-way sweep. At effective
-# batch 32 and context 512, every model sees 1,376,256,000 token positions.
+# Equal-step/equal-token budget for the controlled twelve-way sweep. The 1,024
+# context uses half as many sequences as the former 512-token recipe, preserving
+# both 16,384 positions/update and 1,376,256,000 positions over the full run.
+ATTENTION_SEQUENCE_LENGTH=1024
+ATTENTION_EFFECTIVE_SEQUENCE_BATCH=16
 ATTENTION_EQUAL_TOKEN_STEPS=84000
+ATTENTION_TOKEN_POSITIONS_PER_STEP=$((
+    ATTENTION_SEQUENCE_LENGTH * ATTENTION_EFFECTIVE_SEQUENCE_BATCH
+))
+ATTENTION_TOTAL_TOKEN_POSITIONS=$((
+    ATTENTION_TOKEN_POSITIONS_PER_STEP * ATTENTION_EQUAL_TOKEN_STEPS
+))
 
 resolve_attention_variant() {
     local task_id="${1:?array task id is required}"
-    if [[ ! "$task_id" =~ ^([0-9]|10)$ ]]; then
-        echo "Array task id must be an integer from 0 through 10; got '$task_id'." >&2
+    if [[ ! "$task_id" =~ ^[0-9]+$ ]] \
+        || (( 10#$task_id >= ${#ATTENTION_VARIANTS[@]} )); then
+        echo "Array task id must be an integer from 0 through $((${#ATTENTION_VARIANTS[@]} - 1)); got '$task_id'." >&2
         return 2
     fi
     ATTENTION_VARIANT="${ATTENTION_VARIANTS[$task_id]}"
@@ -46,8 +58,11 @@ resolve_attention_variant() {
     ATTENTION_BACKEND="${ATTENTION_BACKENDS[$task_id]}"
     MODEL_CONFIG="${MODEL_CONFIGS[$task_id]}"
     ATTENTION_TARGET_STEPS="$ATTENTION_EQUAL_TOKEN_STEPS"
+    ATTENTION_TARGET_SEQUENCE_LENGTH="$ATTENTION_SEQUENCE_LENGTH"
+    ATTENTION_TARGET_SEQUENCE_BATCH="$ATTENTION_EFFECTIVE_SEQUENCE_BATCH"
     export ATTENTION_VARIANT ATTENTION_SPACE ATTENTION_BACKEND MODEL_CONFIG
-    export ATTENTION_TARGET_STEPS
+    export ATTENTION_TARGET_STEPS ATTENTION_TARGET_SEQUENCE_LENGTH
+    export ATTENTION_TARGET_SEQUENCE_BATCH
 }
 
 validate_experiment_id() {
@@ -116,6 +131,7 @@ setup_attention_runtime() {
 
     missing_modules="$("$COMPLEX_ATTN_PYTHON" -c '
 import importlib.util
+import os
 
 required = (
     "typing_extensions",
@@ -128,6 +144,8 @@ required = (
     "deepspeed",
     "wandb",
 )
+if os.environ.get("ATTENTION_BACKEND") == "flash_fused":
+    required += ("triton",)
 print(" ".join(name for name in required if importlib.util.find_spec(name) is None))
 ')"
     if [[ -n "$missing_modules" ]]; then

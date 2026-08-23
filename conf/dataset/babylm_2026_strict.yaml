@@ -1,8 +1,12 @@
 name: babylm_2026_strict
 column: text
-path_to_disk: tokenized_datasets/babylm_2026_strict_google_512
-pack_to_length: 512
+path_to_disk: tokenized_datasets/babylm_2026_strict_google_1024
+pack_to_length: 1024
 cross_document_attention: true
+# The pinned full Strict release contains exactly this many source rows. Keep
+# this guard so a partial cache or accidental switch to Strict-Small fails fast.
+expected_source_rows: 11601896
+approx_token_limit: null
 validation_fraction: 0.01
 validation_seed: 0
 train_split: train

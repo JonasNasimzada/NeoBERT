@@ -186,7 +186,8 @@ def _prepare_backend_padding_metadata(key_padding_mask, attention_spaces, attent
     if key_padding_mask is None:
         return None
     needs_metadata = any(
-        backend == "flash" and space in ("real", "complex", "split", "dual")
+        backend in ("flash", "flash_fused")
+        and space in ("real", "complex", "split", "dual")
         for space, backend in zip(attention_spaces, attention_backends)
     )
     if not needs_metadata:
@@ -317,12 +318,14 @@ class NeoBERTConfig(PretrainedConfig):
             raise ValueError("flash_attention must be a bool or None")
         self.flash_attention = flash_attention
         valid_spaces = ("real", "complex", "split", "dual")
-        valid_backends = ("auto", "native", "torch", "flash", "flex")
+        valid_backends = (
+            "auto", "native", "torch", "flash", "flash_fused", "flex"
+        )
         supported_backends = {
             "real": ("auto", "torch", "flash", "flex"),
             "complex": ("auto", "native", "torch", "flash", "flex"),
             "split": ("auto", "native", "torch", "flash", "flex"),
-            "dual": ("auto", "native", "torch", "flash", "flex"),
+            "dual": ("auto", "native", "torch", "flash", "flash_fused", "flex"),
         }
         if attention_space not in valid_spaces:
             raise ValueError(
@@ -330,7 +333,8 @@ class NeoBERTConfig(PretrainedConfig):
             )
         if attention_backend not in valid_backends:
             raise ValueError(
-                "attention_backend must be 'auto', 'native', 'torch', 'flash', or 'flex'"
+                "attention_backend must be 'auto', 'native', 'torch', 'flash', "
+                "'flash_fused', or 'flex'"
             )
         if (
             attention_backends is None
@@ -384,7 +388,7 @@ class NeoBERTConfig(PretrainedConfig):
             if (
                 attention_dropout > 0.0
                 and layer_space == "dual"
-                and layer_backend == "flash"
+                and layer_backend in ("flash", "flash_fused")
             ):
                 raise ValueError(
                     "dual-number FlashAttention does not support attention_dropout"
@@ -816,7 +820,8 @@ class NeoBERT(NeoBERTPreTrainedModel):
             if pad_mask is not None:
                 raise ValueError("packed document_ids cannot be combined with pad_mask")
             if any(
-                backend == "flash" for backend in self.config.attention_backends
+                backend in ("flash", "flash_fused")
+                for backend in self.config.attention_backends
             ):
                 raise ValueError(
                     "packed document masking cannot use direct FlashAttention because "

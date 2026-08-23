@@ -3,7 +3,7 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-10
+#SBATCH --array=0-11
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -32,8 +32,9 @@ setup_attention_runtime
 
 DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-1p376b-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-1p376b-v1}"
 SEED="${SEED:-42}"
+BENCHMARK_TOKEN_BUDGET="${BENCHMARK_TOKEN_BUDGET:-1732608}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
 RUNS_ROOT="$RUNS_ROOT/$EXPERIMENT_ID"
@@ -57,6 +58,7 @@ cd "$NEOBERT_ROOT"
     --output "$BENCHMARK_ROOT/heldout_mlm.json" \
     --variant "$ATTENTION_VARIANT" \
     --seed "$SEED" \
+    --token-budget "$BENCHMARK_TOKEN_BUDGET" \
     --id-prefix "$EXPERIMENT_ID" \
     --project "${WANDB_PROJECT:-complex-attention-ablation}" \
     --entity "${WANDB_ENTITY:-hyper_attention}" \

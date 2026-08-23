@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -38,8 +39,8 @@ class TestPaperProtocols(unittest.TestCase):
         fa1 = [case for case in cases if case.protocol == "fa1-e6"]
         fa2 = [case for case in cases if case.protocol == "fa2-4.1"]
 
-        self.assertEqual(len(fa1), 11 * 10 * 2 * 2)
-        self.assertEqual(len(fa2), 11 * 2 * 6 * 2)
+        self.assertEqual(len(fa1), 12 * 10 * 2 * 2)
+        self.assertEqual(len(fa2), 12 * 2 * 6 * 2)
         self.assertEqual(
             {case.variant for case in cases},
             set(benchmark.DEFAULT_VARIANTS),
@@ -132,7 +133,7 @@ class TestPaperProtocols(unittest.TestCase):
             benchmark._attention_callable(case)
 
     def test_split_and_dual_flash_dropout_are_explicitly_unsupported(self):
-        for variant in ("split-flash", "dual-flash"):
+        for variant in ("split-flash", "dual-flash", "dual-flash-fused"):
             with self.subTest(variant=variant):
                 case = benchmark.BenchmarkCase(
                     protocol="fa1-e6",
@@ -212,8 +213,15 @@ class TestAccounting(unittest.TestCase):
         dual_flash = benchmark._base_row(
             self.make_case(variant="dual-flash"), element_size=2
         )
+        dual_flash_fused = benchmark._base_row(
+            self.make_case(variant="dual-flash-fused"), element_size=2
+        )
         self.assertIn("one-packed-split-complex", split_flash["backend_target"])
         self.assertIn("dense-analytic-tangent", dual_flash["backend_target"])
+        self.assertEqual(
+            dual_flash_fused["backend_target"],
+            "triton-fused-dual-flash",
+        )
         self.assertIsNone(real["backend_effective"])
 
     def test_token_rates_use_batch_times_sequence_for_each_phase(self):
@@ -231,10 +239,57 @@ class TestAccounting(unittest.TestCase):
             benchmark._failure_status(benchmark.UnsupportedCase("missing op")),
             "unsupported",
         )
+        for message in ("requires Triton", "requires compute capability 8+"):
+            self.assertEqual(
+                benchmark._failure_status(RuntimeError(message)), "unsupported"
+            )
         self.assertEqual(benchmark._failure_status(RuntimeError("bad result")), "error")
 
 
 class TestOutput(unittest.TestCase):
+    def _resume_argv(self, output: Path) -> list[str]:
+        return [
+            "--protocol",
+            "fa1",
+            "--variants",
+            "real-torch",
+            "--device",
+            "cpu",
+            "--seed",
+            "7",
+            "--fa1-sequence-lengths",
+            "128,256",
+            "--fa1-dropouts",
+            "0",
+            "--fa1-padding-mask-values",
+            "false",
+            "--fa1-repetitions",
+            "1",
+            "--warmup-repetitions",
+            "1",
+            "--output",
+            str(output),
+            "--resume",
+            "--wandb-mode",
+            "online",
+            "--wandb-project",
+            "resume-tests",
+            "--wandb-entity",
+            "test-entity",
+            "--wandb-group",
+            "test-group",
+            "--wandb-name",
+            "test-name",
+            "--wandb-id",
+            "test-id",
+        ]
+
+    @staticmethod
+    def _finished_row(case):
+        row = benchmark._base_row(case, element_size=2)
+        row["status"] = "ok"
+        return row
+
     def test_atomic_json_replaces_destination_without_temp_files(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "nested" / "results.json"
@@ -245,6 +300,137 @@ class TestOutput(unittest.TestCase):
                 {"rows": [1, 2], "status": "complete"},
             )
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_legacy_partial_resume_validates_exact_case_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "results.json"
+            args = benchmark.build_parser().parse_args(self._resume_argv(output))
+            cases = benchmark.generate_cases(args)
+            legacy_cli = vars(args).copy()
+            legacy_cli.pop("resume")
+            legacy_cli["output"] = str(output.resolve())
+            payload = {
+                "schema_version": 1,
+                "benchmark": "attention-kernels",
+                "status": "running",
+                "cli": legacy_cli,
+                "device": {"requested_device": "cpu"},
+                "rows": [self._finished_row(cases[0])],
+            }
+
+            loaded = benchmark._validate_resume_payload(
+                payload,
+                args=args,
+                cases=cases,
+                metadata={"requested_device": "cpu"},
+            )
+            self.assertEqual(len(loaded["rows"]), 1)
+
+            incompatible = dict(payload)
+            incompatible["rows"] = [dict(payload["rows"][0])]
+            incompatible["rows"][0]["case_id"] = "different-case"
+            with self.assertRaisesRegex(ValueError, "expected case prefix"):
+                benchmark._validate_resume_payload(
+                    incompatible,
+                    args=args,
+                    cases=cases,
+                    metadata={"requested_device": "cpu"},
+                )
+
+            incompatible_args = benchmark.build_parser().parse_args(
+                self._resume_argv(output) + ["--seed", "8"]
+            )
+            with self.assertRaisesRegex(ValueError, "incompatible with the requested"):
+                benchmark._validate_resume_payload(
+                    payload,
+                    args=incompatible_args,
+                    cases=benchmark.generate_cases(incompatible_args),
+                    metadata={"requested_device": "cpu"},
+                )
+
+            device_payload = dict(payload)
+            device_payload["device"] = {
+                "requested_device": "cuda:0",
+                "cuda_device_name": "NVIDIA A100-SXM4-80GB",
+            }
+            with self.assertRaisesRegex(ValueError, "cuda_device_name"):
+                benchmark._validate_resume_payload(
+                    device_payload,
+                    args=args,
+                    cases=cases,
+                    metadata={
+                        "requested_device": "cuda:0",
+                        "cuda_device_name": "different GPU",
+                    },
+                )
+
+    def test_resume_skips_prefix_and_logs_only_new_wandb_steps(self):
+        class FakeRun:
+            def __init__(self):
+                self.logged_steps = []
+                self.summary = {}
+                self.name = "test-name"
+                self.finished = False
+
+            def log(self, payload, step=None):
+                self.logged_steps.append(step)
+
+            def finish(self):
+                self.finished = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "results.json"
+            argv = self._resume_argv(output)
+            args = benchmark.build_parser().parse_args(argv)
+            cases = benchmark.generate_cases(args)
+            metadata = {"requested_device": "cpu"}
+            payload = {
+                "schema_version": 1,
+                "benchmark": "attention-kernels",
+                "status": "running",
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "device": metadata,
+                "cli": vars(args) | {"output": str(output.resolve())},
+                "resume_signature": benchmark._resume_signature(args, cases),
+                "rows": [self._finished_row(cases[0])],
+            }
+            benchmark.atomic_write_json(output, payload)
+            run = FakeRun()
+
+            def finish_case(case, *, device, seed):
+                self.assertEqual(case, cases[1])
+                self.assertEqual(seed, 8)
+                return self._finished_row(case)
+
+            with (
+                mock.patch.object(benchmark, "device_metadata", return_value=metadata),
+                mock.patch.object(
+                    benchmark,
+                    "benchmark_case",
+                    side_effect=finish_case,
+                ) as benchmark_case,
+                mock.patch.object(benchmark, "_wandb_init", return_value=run),
+                mock.patch.object(benchmark, "_wandb_log_results") as log_results,
+            ):
+                self.assertEqual(benchmark.main(argv), 0)
+
+            benchmark_case.assert_called_once()
+            self.assertEqual(run.logged_steps, [1])
+            self.assertTrue(run.finished)
+            log_results.assert_called_once()
+            completed = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(completed["status"], "complete")
+            self.assertEqual(len(completed["rows"]), 2)
+            self.assertEqual(completed["resume_history"][0]["completed_rows"], 1)
+
+            with (
+                mock.patch.object(benchmark, "device_metadata", return_value=metadata),
+                mock.patch.object(benchmark, "benchmark_case") as benchmark_case,
+                mock.patch.object(benchmark, "_wandb_init") as wandb_init,
+            ):
+                self.assertEqual(benchmark.main(argv), 0)
+            benchmark_case.assert_not_called()
+            wandb_init.assert_not_called()
 
     def test_cuda_allocator_note_does_not_claim_hbm_traffic(self):
         note = benchmark.MEMORY_MEASUREMENT_NOTE.lower()

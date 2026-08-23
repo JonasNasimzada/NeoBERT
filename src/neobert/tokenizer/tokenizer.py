@@ -19,12 +19,17 @@ def get_tokenizer(
     # Load Tokenizer and replace/add special tokens
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path,
-        max_length=max_length,
+        model_max_length=max_length,
         vocab_size=vocab_size,
         token=token,
         revision=revision,
         trust_remote_code=trust_remote_code,
     )
+    # Persist the experiment's actual context limit in tokenizer_config.json.
+    # Passing ``max_length`` is only a per-call tokenization option in
+    # Transformers and otherwise leaves BERT's published 512-token metadata in
+    # place, which can silently truncate downstream evaluation.
+    tokenizer.model_max_length = int(max_length)
 
     if pretrained_model_name_or_path != "google-bert/bert-base-uncased":
         # Define special tokens to be consistent with RoBERTa

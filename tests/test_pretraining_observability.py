@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 
 from neobert.pretraining.metrics import Metrics
 from neobert.pretraining.trainer import (
+    advance_gradient_accumulation,
     build_training_summary,
     evaluate_mlm,
     max_time_reached,
@@ -166,6 +167,7 @@ class TestDatasetAndValidation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             manifest = {
                 "sequence_length": 4,
+                "source_rows": 3,
                 "packing": {
                     "padding_free": True,
                     "cross_document_attention": True,
@@ -197,12 +199,22 @@ class TestDatasetAndValidation(unittest.TestCase):
                         "path_to_disk": str(path),
                         "pack_to_length": 4,
                         "cross_document_attention": True,
+                        "expected_source_rows": 3,
                     }
                 }
             )
 
             validate_flat_packed_dataset_dict(dataset, cfg)
 
+            manifest["source_rows"] = 2
+            (path / "optibertneo_manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "source row count"):
+                validate_flat_packed_dataset_dict(dataset, cfg)
+
+            manifest["source_rows"] = 3
             manifest["splits"]["validation"]["rows"] = 2
             (path / "optibertneo_manifest.json").write_text(
                 json.dumps(manifest),
@@ -286,6 +298,58 @@ class TestDatasetAndValidation(unittest.TestCase):
 
 
 class TestRunMetadataAndTimeLimit(unittest.TestCase):
+    def test_short_epoch_tail_does_not_advance_gradient_accumulation(self):
+        metrics = Metrics()
+        target_batch_size = 8
+        update_groups = []
+        processed_since_update = 0
+
+        for epoch_batch_sizes in (
+            (8, 8, 8, 3),
+            (8, 8, 8, 8, 8),
+        ):
+            for batch_size in epoch_batch_sizes:
+                # This counter remains the raw dataloader position used by
+                # checkpoint resume, including the skipped short tail.
+                metrics["train/batches"] += 1
+                if batch_size < target_batch_size:
+                    continue
+
+                processed_since_update += 1
+                if advance_gradient_accumulation(metrics, 4):
+                    update_groups.append(processed_since_update)
+                    processed_since_update = 0
+
+        self.assertEqual(update_groups, [4, 4])
+        self.assertEqual(processed_since_update, 0)
+        self.assertEqual(metrics["train/batches"], 9)
+        self.assertEqual(metrics["train/processed_batches"], 8)
+
+    def test_accumulation_counter_resumes_without_changing_data_position(self):
+        checkpointed = Metrics()
+        checkpointed["train/batches"] = 9
+        checkpointed["train/steps"] = 2
+        checkpointed["train/processed_batches"] = 8
+
+        resumed = Metrics()
+        resumed.load_state_dict(checkpointed.state_dict())
+
+        self.assertFalse(advance_gradient_accumulation(resumed, 4))
+        self.assertFalse(advance_gradient_accumulation(resumed, 4))
+        self.assertFalse(advance_gradient_accumulation(resumed, 4))
+        self.assertTrue(advance_gradient_accumulation(resumed, 4))
+        self.assertEqual(resumed["train/batches"], 9)
+        self.assertEqual(resumed["train/processed_batches"], 12)
+
+    def test_legacy_checkpoint_derives_accumulation_phase_from_steps(self):
+        metrics = Metrics()
+        metrics["train/batches"] = 9
+        metrics["train/steps"] = 2
+
+        self.assertFalse(advance_gradient_accumulation(metrics, 4))
+        self.assertEqual(metrics["train/processed_batches"], 9)
+        self.assertEqual(metrics["train/batches"], 9)
+
     def test_wandb_identity_is_stable_resolved_and_credential_free(self):
         cfg = OmegaConf.create(
             {

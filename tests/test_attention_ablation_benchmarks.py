@@ -84,6 +84,14 @@ class TestVariantMatrix(unittest.TestCase):
             ("dual", "flash"),
         )
         self.assertEqual(
+            benchmark_mlm.canonical_variant("DUAL_FLASH_FUSED"),
+            "dual-flash-fused",
+        )
+        self.assertEqual(
+            benchmark_mlm.VARIANT_MATRIX["dual-flash-fused"],
+            ("dual", "flash_fused"),
+        )
+        self.assertEqual(
             set(benchmark_mlm.VARIANT_MATRIX),
             {
                 "complex-native",
@@ -97,11 +105,26 @@ class TestVariantMatrix(unittest.TestCase):
                 "dual-native",
                 "dual-torch",
                 "dual-flash",
+                "dual-flash-fused",
             },
         )
 
-    def test_heldout_token_budget_is_doubled(self):
-        self.assertEqual(benchmark_mlm.DEFAULT_TOKEN_BUDGET, 2_097_152)
+    def test_heldout_token_budget_fits_prepared_validation_split(self):
+        self.assertEqual(
+            benchmark_mlm.DEFAULT_CONTEXT_LENGTHS,
+            (128, 256, 512, 1024),
+        )
+        self.assertEqual(benchmark_mlm.DEFAULT_TOKEN_BUDGET, 1_732_608)
+        self.assertEqual(
+            benchmark_mlm.DEFAULT_TOKEN_BUDGET
+            % benchmark_mlm.DEFAULT_BATCH_TOKENS,
+            0,
+        )
+        for context_length in benchmark_mlm.DEFAULT_CONTEXT_LENGTHS:
+            self.assertEqual(
+                benchmark_mlm.DEFAULT_TOKEN_BUDGET % context_length,
+                0,
+            )
 
 
 class TestBenchmarkMemoryMetrics(unittest.TestCase):
@@ -433,9 +456,9 @@ class TestBabyLMResultParsing(unittest.TestCase):
 class TestBabyLMFlashCompatibility(unittest.TestCase):
     def test_padded_batch_is_evaluated_as_padding_free_rows(self):
         class FakeFlashModel(torch.nn.Module):
-            def __init__(self):
+            def __init__(self, backend):
                 super().__init__()
-                self.config = types.SimpleNamespace(attention_backends=["flash"])
+                self.config = types.SimpleNamespace(attention_backends=[backend])
                 self.calls = []
 
             def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -449,28 +472,34 @@ class TestBabyLMFlashCompatibility(unittest.TestCase):
                 logits = input_ids.unsqueeze(-1).expand(*input_ids.shape, 5).float()
                 return types.SimpleNamespace(logits=logits)
 
-        model = padding_free_flash.install_padding_free_flash_forward(
-            FakeFlashModel()
-        )
         input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
         attention_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
 
-        output = model(input_ids=input_ids, attention_mask=attention_mask)
+        for backend in ("flash", "flash_fused"):
+            with self.subTest(backend=backend):
+                model = padding_free_flash.install_padding_free_flash_forward(
+                    FakeFlashModel(backend)
+                )
+                output = model(input_ids=input_ids, attention_mask=attention_mask)
 
-        self.assertEqual(tuple(output.logits.shape), (2, 4, 5))
-        self.assertEqual(
-            [shape for shape, _ in model.calls],
-            [(1, 3), (1, 2)],
-        )
-        self.assertTrue(all(mask is None for _, mask in model.calls))
-        torch.testing.assert_close(output.logits[0, :3, 0], input_ids[0, :3].float())
-        torch.testing.assert_close(output.logits[1, :2, 0], input_ids[1, :2].float())
-        self.assertTrue(output.logits[0, 3].eq(0).all())
-        self.assertTrue(output.logits[1, 2:].eq(0).all())
+                self.assertEqual(tuple(output.logits.shape), (2, 4, 5))
+                self.assertEqual(
+                    [shape for shape, _ in model.calls],
+                    [(1, 3), (1, 2)],
+                )
+                self.assertTrue(all(mask is None for _, mask in model.calls))
+                torch.testing.assert_close(
+                    output.logits[0, :3, 0], input_ids[0, :3].float()
+                )
+                torch.testing.assert_close(
+                    output.logits[1, :2, 0], input_ids[1, :2].float()
+                )
+                self.assertTrue(output.logits[0, 3].eq(0).all())
+                self.assertTrue(output.logits[1, 2:].eq(0).all())
 
-        model.calls.clear()
-        model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
-        self.assertEqual(model.calls, [((2, 4), None)])
+                model.calls.clear()
+                model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+                self.assertEqual(model.calls, [((2, 4), None)])
 
 
 if __name__ == "__main__":

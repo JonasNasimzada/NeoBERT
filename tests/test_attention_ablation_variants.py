@@ -28,7 +28,7 @@ SPEC.loader.exec_module(validator)
 
 
 class TestAttentionAblationVariants(unittest.TestCase):
-    def test_exact_eleven_variant_matrix_is_parameter_matched(self):
+    def test_exact_twelve_variant_matrix_is_parameter_matched(self):
         self.assertEqual(
             [
                 (variant.attention_space, variant.attention_backend)
@@ -46,12 +46,13 @@ class TestAttentionAblationVariants(unittest.TestCase):
                 ("dual", "native"),
                 ("dual", "torch"),
                 ("dual", "flash"),
+                ("dual", "flash_fused"),
             ],
         )
 
         counts = validator.validate_variants(verbose=False)
 
-        self.assertEqual(len(counts), 11)
+        self.assertEqual(len(counts), 12)
         self.assertEqual(
             set(counts.values()),
             {validator.EXPECTED_TRAINABLE_PARAMETERS},
@@ -61,7 +62,7 @@ class TestAttentionAblationVariants(unittest.TestCase):
         common_path = NEOBERT_ROOT / "jobs" / "attention_ablation" / "common.sh"
         command = r'''
 source "$1"
-for task_id in {0..10}; do
+for task_id in {0..11}; do
     resolve_attention_variant "$task_id"
     printf '%s:%s:%s:%s\n' \
         "$ATTENTION_VARIANT" \
@@ -90,7 +91,30 @@ done
                 "dual-native:dual:native:84000",
                 "dual-torch:dual:torch:84000",
                 "dual-flash:dual:flash:84000",
+                "dual-flash-fused:dual:flash_fused:84000",
             ],
+        )
+
+    def test_1024_geometry_preserves_the_controlled_token_budget(self):
+        common_path = NEOBERT_ROOT / "jobs" / "attention_ablation" / "common.sh"
+        command = r'''
+source "$1"
+printf '%s:%s:%s:%s:%s\n' \
+    "$ATTENTION_SEQUENCE_LENGTH" \
+    "$ATTENTION_EFFECTIVE_SEQUENCE_BATCH" \
+    "$ATTENTION_TOKEN_POSITIONS_PER_STEP" \
+    "$ATTENTION_EQUAL_TOKEN_STEPS" \
+    "$ATTENTION_TOTAL_TOKEN_POSITIONS"
+'''
+        completed = subprocess.run(
+            ["bash", "-c", command, "bash", str(common_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.stdout.strip(),
+            "1024:16:16384:84000:1376256000",
         )
 
     def test_slurm_scope_validators_are_available_to_every_job_script(self):

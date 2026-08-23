@@ -3,16 +3,16 @@ mixed_precision: bf16
 resume: true
 disable_tqdm: false
 
-# 84,000 * 32 packed sequences/update * 512 = 1,376,256,000 token positions.
+# 84,000 * 16 packed sequences/update * 1,024 = 1,376,256,000 token positions.
 max_steps: 84000
 gradient_accumulation_steps: 4
 gradient_clipping: 1.0
 
-# Emergency guard for the six-hour allocation. Doubling the controlled token
-# budget approximately doubles the calibrated runtime; this leaves six minutes
-# for final export. A guard stop
+# Emergency guard for the fifteen-hour allocation. Moving from 512 to 1,024
+# preserves the token budget but approximately doubles dense-attention work;
+# this leaves six minutes for final export. A guard stop
 # is marked incomplete so its dependent benchmark cannot publish partial data.
-max_time_seconds: 21240
+max_time_seconds: 53640
 
 # Compilation is intentionally disabled for the first controlled sweep. The
 # custom native operators should be measured directly.

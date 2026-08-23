@@ -36,14 +36,13 @@ class NeoBERTComplexAttention(nn.Module):
         super().__init__()
         try:
             from complex_attention import (
-                ComplexLinear,
                 DualLinear,
                 SplitComplexLinear,
                 complex_attention,
                 dual_attention,
                 split_complex_attention,
             )
-        except ImportError as error:
+        except (ImportError, OSError) as error:
             raise ImportError(
                 "Install ComplexAttention with `pip install -e /Users/joni/PycharmProjects/ComplexAttention --no-deps`"
             ) from error
@@ -59,8 +58,9 @@ class NeoBERTComplexAttention(nn.Module):
         self._dual_attention = dual_attention
 
         if self.space == "complex":
-            self.qkv = ComplexLinear(config.hidden_size, config.hidden_size * 3, bias=False)
-            self.out_proj = ComplexLinear(config.hidden_size, config.hidden_size, bias=False)
+            kwargs = {"bias": False, "dtype": torch.cfloat}
+            self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, **kwargs)
+            self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, **kwargs)
             readout = torch.zeros(2, config.hidden_size)
             readout[0].fill_(1.0)
         elif self.space == "split":
@@ -79,25 +79,22 @@ class NeoBERTComplexAttention(nn.Module):
     def reset_parameters(self, initialization_range: float) -> None:
         if self.space == "complex":
             bound = initialization_range / math.sqrt(2.0)
-            layers = (self.qkv, self.out_proj)
             with torch.no_grad():
-                for layer in layers:
-                    layer.weight_real.uniform_(-bound, bound)
-                    layer.weight_imag.uniform_(-bound, bound)
+                for layer in (self.qkv, self.out_proj):
+                    layer.weight.real.uniform_(-bound, bound)
+                    layer.weight.imag.uniform_(-bound, bound)
         elif self.space == "split":
             bound = initialization_range / math.sqrt(2.0)
             layers = (self.qkv, self.out_proj)
             with torch.no_grad():
                 for layer in layers:
-                    layer.weight_real.uniform_(-bound, bound)
-                    layer.weight_split.uniform_(-bound, bound)
+                    layer.linear.weight.uniform_(-bound, bound)
         elif self.space == "dual":
             bound = initialization_range / math.sqrt(2.0)
             layers = (self.qkv, self.out_proj)
             with torch.no_grad():
                 for layer in layers:
-                    layer.weight_primal.uniform_(-bound, bound)
-                    layer.weight_dual.uniform_(-bound, bound)
+                    layer.linear.weight.uniform_(-bound, bound)
         with torch.no_grad():
             self.readout.zero_()
             self.readout[0].fill_(1.0)
@@ -113,32 +110,25 @@ class NeoBERTComplexAttention(nn.Module):
         block_mask: Any,
         prepared_key_padding_mask: Any,
     ) -> Tensor:
-        qkv_real, qkv_imag = self.qkv.forward_real(x)
-        q_real, k_real, v_real = _reshape_qkv(qkv_real, self.num_heads, self.head_dim)
-        q_imag, k_imag, v_imag = _reshape_qkv(qkv_imag, self.num_heads, self.head_dim)
-        query = q_real, q_imag
-        key = k_real, k_imag
-        value = v_real, v_imag
-        if self.rope:
-            query, key = _apply_pair_rope(query, key, freqs_cis)
-        uses_block_mask = self.backend == "flex" and block_mask is not None
-        direct_mask = None if uses_block_mask else attn_mask
-        direct_key_padding = None if uses_block_mask else key_padding_mask
-        direct_prepared_padding = None if uses_block_mask else prepared_key_padding_mask
         output, _ = self._complex_attention(
-            tuple(_to_attention_layout(component) for component in query),
-            tuple(_to_attention_layout(component) for component in key),
-            tuple(_to_attention_layout(component) for component in value),
-            attn_mask=direct_mask,
-            key_padding_mask=direct_key_padding,
+            (x, torch.zeros_like(x)),
+            self.qkv,
+            self.out_proj,
+            self.num_heads,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
             scale=self.head_dim**-0.5,
             dropout_p=self.attention_dropout if self.training else 0.0,
             backend=self.backend,
             block_mask=block_mask,
-            prepared_key_padding_mask=direct_prepared_padding,
+            prepared_key_padding_mask=prepared_key_padding_mask,
+            rotary_emb=apply_rotary_emb if self.rope else None,
+            freqs_cis=freqs_cis,
         )
-        output = tuple(_from_attention_layout(component) for component in output)
-        return self.out_proj.forward_readout(output, self.readout)
+        return sum(
+            component * coefficient.to(component)
+            for component, coefficient in zip(output, self.readout)
+        )
 
     def _split_forward(
         self,

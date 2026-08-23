@@ -20,7 +20,7 @@ def _uses_strict_flash(model) -> bool:
     backends = getattr(model.config, "attention_backends", None)
     if backends is None:
         backends = [getattr(model.config, "attention_backend", None)]
-    return "flash" in backends
+    return any(backend in ("flash", "flash_fused") for backend in backends)
 
 
 def install_padding_free_flash_forward(model):

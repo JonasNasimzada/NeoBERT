@@ -43,6 +43,7 @@ DEFAULT_VARIANTS = (
     "dual-native",
     "dual-torch",
     "dual-flash",
+    "dual-flash-fused",
 )
 ALL_VARIANTS = DEFAULT_VARIANTS
 
@@ -92,6 +93,15 @@ FLOP_MEASUREMENT_NOTE = (
     "only paper_nominal_* is directly comparable with the paper plots."
 )
 
+RESUME_DEVICE_FIELDS = (
+    "torch_version",
+    "torch_cuda_version",
+    "cuda_device_name",
+    "cuda_capability",
+    "cuda_total_memory_bytes",
+    "cuda_multiprocessor_count",
+)
+
 
 @dataclass(frozen=True)
 class VariantSpec:
@@ -113,6 +123,7 @@ VARIANT_SPECS = {
     "dual-native": VariantSpec("dual_number", "native", 2, 3.0),
     "dual-torch": VariantSpec("dual_number", "torch", 2, 3.0),
     "dual-flash": VariantSpec("dual_number", "flash", 2, 3.0),
+    "dual-flash-fused": VariantSpec("dual_number", "flash_fused", 2, 3.0),
 }
 BACKEND_TARGETS = {
     "complex-native": "pytorch-sdpa-math-packed-complex",
@@ -126,6 +137,7 @@ BACKEND_TARGETS = {
     "dual-native": "custom-aten-dual-number",
     "dual-torch": "pytorch-jvp-sdpa",
     "dual-flash": "pytorch-sdpa-flash-primal-plus-dense-analytic-tangent",
+    "dual-flash-fused": "triton-fused-dual-flash",
 }
 
 
@@ -403,13 +415,13 @@ def _attention_callable(case: BenchmarkCase) -> Callable[[Any, Any, Any, Tensor 
     """Resolve implementations lazily so importing this module needs no extension."""
     spec = VARIANT_SPECS[case.variant]
     scale = case.head_dim**-0.5
-    if spec.backend == "flash" and case.padding_mask:
+    if spec.backend in ("flash", "flash_fused") and case.padding_mask:
         raise UnsupportedCase(
             "strict FlashAttention does not accept key-padding masks; the row is "
             "reported as unsupported instead of falling back to another backend"
         )
     if (
-        spec.backend == "flash"
+        spec.backend in ("flash", "flash_fused")
         and case.dropout_p
         and spec.algebra in ("split_complex", "dual_number")
     ):
@@ -447,7 +459,7 @@ def _attention_callable(case: BenchmarkCase) -> Callable[[Any, Any, Any, Tensor 
 
     if spec.algebra == "ordinary_complex":
         try:
-            from complex_attention import complex_attention
+            from complex_attention import complex_dot_product_attention as complex_attention
         except (ImportError, OSError) as error:
             raise UnsupportedCase(
                 "ordinary-complex benchmark requires complex_attention"
@@ -666,6 +678,8 @@ def _failure_status(error: BaseException) -> str:
         "not supported",
         "unsupported",
         "requires cuda",
+        "requires triton",
+        "requires compute capability",
         "requires the custom",
         "no available kernel",
         "no viable backend",
@@ -886,6 +900,148 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         raise
 
 
+def _resume_signature(
+    args: argparse.Namespace,
+    cases: Sequence[BenchmarkCase],
+) -> dict[str, Any]:
+    """Describe every input that can change rows or their W&B destination."""
+    return {
+        "version": 1,
+        "seed": args.seed,
+        "device": str(args.device),
+        "fail_on_error": bool(args.fail_on_error),
+        "cases": [asdict(case) for case in cases],
+        "wandb": {
+            "mode": args.wandb_mode,
+            "project": args.wandb_project,
+            "entity": args.wandb_entity,
+            "group": args.wandb_group,
+            "name": args.wandb_name,
+            "id": args.wandb_id,
+            "tags": list(args.wandb_tags),
+        },
+    }
+
+
+def _legacy_resume_signature(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reconstruct a signature for schema-v1 files written before --resume."""
+    cli = payload.get("cli")
+    if not isinstance(cli, Mapping):
+        raise ValueError("resume file does not contain a valid cli configuration")
+    try:
+        legacy_args = argparse.Namespace(**dict(cli))
+        legacy_cases = generate_cases(legacy_args)
+        return _resume_signature(legacy_args, legacy_cases)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "resume file cli configuration cannot reconstruct its benchmark cases"
+        ) from error
+
+
+def _validate_resume_payload(
+    payload: Mapping[str, Any],
+    *,
+    args: argparse.Namespace,
+    cases: Sequence[BenchmarkCase],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and return a mutable compatible running or complete payload."""
+    if payload.get("schema_version") != 1:
+        raise ValueError(
+            "resume file has an unsupported schema_version: "
+            f"{payload.get('schema_version')!r}"
+        )
+    if payload.get("benchmark") != "attention-kernels":
+        raise ValueError("resume file is not an attention-kernels benchmark")
+    status = payload.get("status")
+    if status not in ("running", "complete"):
+        raise ValueError(
+            f"resume file status must be 'running' or 'complete', got {status!r}"
+        )
+
+    expected_signature = _resume_signature(args, cases)
+    stored_signature = payload.get("resume_signature")
+    if stored_signature is None:
+        stored_signature = _legacy_resume_signature(payload)
+    if stored_signature != expected_signature:
+        raise ValueError(
+            "resume file is incompatible with the requested cases, seed, device, "
+            "error policy, or W&B destination"
+        )
+
+    stored_device = payload.get("device")
+    if not isinstance(stored_device, Mapping):
+        raise ValueError("resume file does not contain valid device metadata")
+    mismatched_device_fields = [
+        name
+        for name in RESUME_DEVICE_FIELDS
+        if name in stored_device
+        and name in metadata
+        and stored_device[name] != metadata[name]
+    ]
+    if mismatched_device_fields:
+        raise ValueError(
+            "resume device/software is incompatible in: "
+            + ", ".join(mismatched_device_fields)
+        )
+
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("resume file rows must be a list")
+    if len(rows) > len(cases):
+        raise ValueError(
+            f"resume file has {len(rows)} rows but this run has only {len(cases)} cases"
+        )
+    completed_statuses = {"ok", "unsupported", "oom", "error"}
+    case_fields = tuple(BenchmarkCase.__dataclass_fields__)
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"resume row {index} is not an object")
+        case = cases[index]
+        mismatched_case_fields = [
+            name for name in case_fields if row.get(name) != getattr(case, name)
+        ]
+        if row.get("case_id") != case.case_id:
+            mismatched_case_fields.append("case_id")
+        if mismatched_case_fields:
+            raise ValueError(
+                f"resume row {index} is not the expected case prefix; mismatched: "
+                + ", ".join(mismatched_case_fields)
+            )
+        if row.get("status") not in completed_statuses:
+            raise ValueError(
+                f"resume row {index} is not complete: status={row.get('status')!r}"
+            )
+    if status == "complete" and len(rows) != len(cases):
+        raise ValueError(
+            f"complete resume file has {len(rows)} of {len(cases)} expected rows"
+        )
+    return dict(payload)
+
+
+def _read_resume_payload(
+    output: Path,
+    *,
+    args: argparse.Namespace,
+    cases: Sequence[BenchmarkCase],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        loaded = json.loads(output.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read resume file {output}: {error}") from error
+    if not isinstance(loaded, Mapping):
+        raise ValueError(f"resume file {output} must contain a JSON object")
+    return _validate_resume_payload(
+        loaded,
+        args=args,
+        cases=cases,
+        metadata=metadata,
+    )
+
+
 def _wandb_init(
     args: argparse.Namespace,
     metadata: Mapping[str, Any],
@@ -1006,6 +1162,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--output", type=Path, default=Path("attention-kernels.json"))
     parser.add_argument("--fail-on-error", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue a compatible running output file from its completed row "
+            "prefix; a compatible complete file is left unchanged."
+        ),
+    )
 
     parser.add_argument("--fa1-sequence-lengths", type=_parse_int_csv, default=FA1_SEQUENCE_LENGTHS)
     parser.add_argument("--fa1-batch-size", type=int, default=16)
@@ -1080,22 +1244,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         device = torch.device("cuda", device_index)
     metadata = device_metadata(device)
     output = args.output.expanduser().resolve()
-    payload: dict[str, Any] = {
-        "schema_version": 1,
-        "benchmark": "attention-kernels",
-        "status": "running",
-        "started_at": _utc_now(),
-        "paper_protocols": PROTOCOL_METADATA,
-        "memory_measurement_note": MEMORY_MEASUREMENT_NOTE,
-        "flop_measurement_note": FLOP_MEASUREMENT_NOTE,
-        "device": metadata,
-        "cli": vars(args) | {"output": str(output)},
-        "rows": [],
-    }
-    atomic_write_json(output, payload)
+    if args.resume and output.exists():
+        payload = _read_resume_payload(
+            output,
+            args=args,
+            cases=cases,
+            metadata=metadata,
+        )
+        if payload["status"] == "complete":
+            error_count = sum(row["status"] == "error" for row in payload["rows"])
+            print(
+                f"Benchmark already complete: {len(cases)}/{len(cases)} rows in {output}",
+                flush=True,
+            )
+            return int(error_count > 0)
+        resumed_at = _utc_now()
+        payload["resume_signature"] = _resume_signature(args, cases)
+        payload.setdefault("resume_history", []).append(
+            {
+                "resumed_at": resumed_at,
+                "completed_rows": len(payload["rows"]),
+                "remaining_rows": len(cases) - len(payload["rows"]),
+                "device": metadata,
+            }
+        )
+        payload["updated_at"] = resumed_at
+        atomic_write_json(output, payload)
+        print(
+            f"Resuming benchmark at row {len(payload['rows']) + 1}/{len(cases)} "
+            f"from {output}",
+            flush=True,
+        )
+    else:
+        payload = {
+            "schema_version": 1,
+            "benchmark": "attention-kernels",
+            "status": "running",
+            "started_at": _utc_now(),
+            "paper_protocols": PROTOCOL_METADATA,
+            "memory_measurement_note": MEMORY_MEASUREMENT_NOTE,
+            "flop_measurement_note": FLOP_MEASUREMENT_NOTE,
+            "device": metadata,
+            "cli": vars(args) | {"output": str(output)},
+            "resume_signature": _resume_signature(args, cases),
+            "rows": [],
+        }
+        atomic_write_json(output, payload)
     run = _wandb_init(args, metadata, cases)
     try:
-        for index, case in enumerate(cases):
+        first_pending_index = len(payload["rows"])
+        for index in range(first_pending_index, len(cases)):
+            case = cases[index]
             row = benchmark_case(case, device=device, seed=args.seed + index)
             payload["rows"].append(row)
             payload["updated_at"] = _utc_now()

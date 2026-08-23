@@ -3,11 +3,11 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-10
+#SBATCH --array=0-11
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --time=06:00:00
+#SBATCH --time=15:00:00
 #SBATCH --output=ca-babylm-train-%A_%a.out
 
 set -euo pipefail
@@ -30,12 +30,12 @@ setup_attention_runtime
 
 DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-1p376b-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-1p376b-v1}"
 SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-$ATTENTION_TARGET_STEPS}"
-MICRO_BATCH="${MICRO_BATCH:-8}"
+MICRO_BATCH="${MICRO_BATCH:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
-MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-21240}"
+MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-53640}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
 if [[ ! "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]]; then
@@ -57,8 +57,8 @@ RUNS_ROOT="$RUNS_ROOT/$EXPERIMENT_ID"
 RUN_ROOT="$RUNS_ROOT/$ATTENTION_VARIANT/seed-$SEED"
 WANDB_RUN_ID="ca-${EXPERIMENT_ID}-${ATTENTION_VARIANT}-s${SEED}"
 
-if (( MICRO_BATCH * GRAD_ACCUM != 32 )); then
-    echo "MICRO_BATCH * GRAD_ACCUM must remain 32 for the controlled sweep." >&2
+if (( MICRO_BATCH * GRAD_ACCUM != ATTENTION_TARGET_SEQUENCE_BATCH )); then
+    echo "MICRO_BATCH * GRAD_ACCUM must remain $ATTENTION_TARGET_SEQUENCE_BATCH for the controlled sweep." >&2
     exit 2
 fi
 
@@ -76,6 +76,8 @@ cd "$NEOBERT_ROOT"
     model="$MODEL_CONFIG" \
     model.attention_backend="$ATTENTION_BACKEND" \
     dataset.path_to_disk="$DATASET_PATH" \
+    dataset.pack_to_length="$ATTENTION_TARGET_SEQUENCE_LENGTH" \
+    tokenizer.max_length="$ATTENTION_TARGET_SEQUENCE_LENGTH" \
     trainer.dir="$RUN_ROOT" \
     trainer.max_steps="$MAX_STEPS" \
     trainer.max_time_seconds="$MAX_TIME_SECONDS" \
@@ -86,7 +88,9 @@ cd "$NEOBERT_ROOT"
     scheduler.warmup_steps="$WARMUP_STEPS" \
     scheduler.decay_steps="$MAX_STEPS" \
     dataloader.train.batch_size="$MICRO_BATCH" \
+    dataloader.train.max_length="$ATTENTION_TARGET_SEQUENCE_LENGTH" \
     dataloader.validation.batch_size="$MICRO_BATCH" \
+    dataloader.validation.max_length="$ATTENTION_TARGET_SEQUENCE_LENGTH" \
     seed="$SEED" \
     wandb.log_interval="$LOG_INTERVAL" \
     wandb.id="$WANDB_RUN_ID" \

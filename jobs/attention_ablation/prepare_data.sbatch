@@ -31,5 +31,5 @@ DATASET_PATH="$(realpath -m "${DATASET_PATH:?Set DATASET_PATH to a new output di
 cd "$NEOBERT_ROOT"
 "$COMPLEX_ATTN_PYTHON" scripts/pretraining/preprocess.py \
     dataset=babylm_2026_strict \
-    tokenizer=google-512 \
+    tokenizer=google-1024 \
     dataset.path_to_disk="$DATASET_PATH"

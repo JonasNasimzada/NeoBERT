@@ -41,6 +41,25 @@ def select_approx_token_limit(dataset, token_limit):
     )
 
 
+def validate_expected_source_rows(dataset, expected_rows=None):
+    """Fail fast when a pinned full-corpus recipe resolves to the wrong size."""
+    if expected_rows is None:
+        return dataset
+    if isinstance(dataset, DatasetDict):
+        raise TypeError("source-row validation expects one resolved source split")
+    expected_rows = int(expected_rows)
+    if expected_rows <= 0:
+        raise ValueError("dataset.expected_source_rows must be positive")
+    actual_rows = len(dataset)
+    if actual_rows != expected_rows:
+        raise ValueError(
+            "source dataset row count does not match the pinned full corpus: "
+            f"got {actual_rows:,}, expected {expected_rows:,}"
+        )
+    print(f"Validated complete source dataset: {actual_rows:,} rows")
+    return dataset
+
+
 def create_train_validation_split(
     dataset,
     validation_fraction=None,
@@ -169,7 +188,7 @@ def _split_manifest(dataset, sequence_length):
     }
 
 
-def save_preprocessed_dataset(dataset, tokenizer, cfg):
+def save_preprocessed_dataset(dataset, tokenizer, cfg, *, source_rows=None):
     output_path = Path(cfg.dataset.path_to_disk).resolve()
     if output_path.exists():
         raise FileExistsError(
@@ -212,6 +231,7 @@ def save_preprocessed_dataset(dataset, tokenizer, cfg):
         "format_version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": OmegaConf.to_container(cfg.dataset.train, resolve=True),
+        "source_rows": int(source_rows) if source_rows is not None else None,
         "source_token_limit": (
             int(configured_token_limit)
             if configured_token_limit is not None
@@ -287,6 +307,11 @@ def preprocess(cfg: DictConfig):
         dataset = dataset.shuffle(seed=0)
     else:
         dataset = load_dataset(**cfg.dataset.train)
+    dataset = validate_expected_source_rows(
+        dataset,
+        cfg.dataset.get("expected_source_rows"),
+    )
+    source_rows = len(dataset)
     dataset = select_approx_token_limit(
         dataset,
         cfg.dataset.get("approx_token_limit"),
@@ -353,7 +378,12 @@ def preprocess(cfg: DictConfig):
     for split_name, split_dataset in _dataset_splits(dataset):
         print(f"Prepared {len(split_dataset):,} {split_name} rows")
 
-    save_preprocessed_dataset(dataset, tokenizer, cfg)
+    save_preprocessed_dataset(
+        dataset,
+        tokenizer,
+        cfg,
+        source_rows=source_rows,
+    )
 
 
 if __name__ == "__main__":

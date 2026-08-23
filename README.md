@@ -24,7 +24,7 @@ PyTorch. Attention backends are selected per scalar space:
 | Real | `auto`, `torch`, `flash`, `flex` |
 | Ordinary complex | `auto`, `native`, `torch`, `flash`, `flex` |
 | Split complex | `auto`, `native`, `torch`, `flash`, `flex` |
-| Dual number | `auto`, `native`, `torch`, `flash`, `flex` |
+| Dual number | `auto`, `native`, `torch`, `flash`, `flash_fused`, `flex` |
 
 The legacy `flash_attention` flag maps `true` to `flash` and `false` to
 `torch`. Packed-document schedules should use `flex`; direct `flash` does not
@@ -37,6 +37,11 @@ CUDA FP16/BF16 only, requires equal Q/K/V head widths no greater than 256,
 square causal attention or no mask, no actually padded keys, no attention
 weights, and `attention_dropout=0`. Use `dual` with `flex` for packed-document
 masks; its exact tangent is likewise dense, but it supports attention dropout.
+For linear-memory dual attention, `flash_fused` streams the primal and tangent
+through Triton kernels. It requires finite CUDA FP16/BF16 inputs, Triton, an
+SM80-or-newer GPU, head dimensions no larger than 128, no padded keys or
+arbitrary masks, and `attention_dropout=0`; its custom backward supports
+first-order reverse-mode autograd.
 
 ## How to use
 

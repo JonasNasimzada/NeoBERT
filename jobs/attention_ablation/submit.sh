@@ -6,7 +6,7 @@ job_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 neobert_root="$(cd "$job_dir/../.." && pwd)"
 : "${DATASET_PATH:?Export DATASET_PATH before submitting the sweep.}"
 source "$job_dir/common.sh"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-1p376b-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-1p376b-v1}"
 SEED="${SEED:-42}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
@@ -26,7 +26,7 @@ train_job_id="$(
         --partition=slowlane \
         --gpus=A100:1 \
         --qos=hiwi_project \
-        --array=0-10 \
+        --array=0-11 \
         --chdir="$neobert_root" \
         --export=ALL,NEOBERT_ROOT="$neobert_root" \
         "$job_dir/train.sbatch"
@@ -38,7 +38,7 @@ benchmark_job_id="$(
         --partition=slowlane \
         --gpus=A100:1 \
         --qos=hiwi_project \
-        --array=0-10 \
+        --array=0-11 \
         --chdir="$neobert_root" \
         --export=ALL,NEOBERT_ROOT="$neobert_root" \
         --dependency="aftercorr:$train_job_id" \
@@ -51,7 +51,7 @@ paper_benchmark_job_id="$(
         --partition=slowlane \
         --gpus=A100:1 \
         --qos=hiwi_project \
-        --array=0-10 \
+        --array=0-11 \
         --chdir="$neobert_root" \
         --export=ALL,NEOBERT_ROOT="$neobert_root" \
         --dependency="aftercorr:$train_job_id" \

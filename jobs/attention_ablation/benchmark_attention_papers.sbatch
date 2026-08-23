@@ -3,12 +3,12 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-10
+#SBATCH --array=0-11
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=ca-attn-papers-%A_%a.out
 #SBATCH --error=ca-attn-papers-%A_%a.err
 
@@ -31,7 +31,7 @@ resolve_attention_variant "${SLURM_ARRAY_TASK_ID:?This job must run as an array 
 setup_attention_runtime
 
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-1p376b-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-1p376b-v1}"
 SEED="${SEED:-42}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
@@ -55,6 +55,7 @@ cd "$NEOBERT_ROOT"
     --variants "$ATTENTION_VARIANT" \
     --seed "$SEED" \
     --output "$BENCHMARK_ROOT/attention_papers.json" \
+    --resume \
     --wandb-mode "${WANDB_MODE:-online}" \
     --wandb-project "${WANDB_PROJECT:-complex-attention-ablation}" \
     --wandb-entity "${WANDB_ENTITY:-hyper_attention}" \

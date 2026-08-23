@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - dataset: babylm_2026_strict
-  - tokenizer: google-512
+  - tokenizer: google-1024
   - model: attention-ablation-complex
   - optimizer: attention-ablation
   - scheduler: attention-ablation
@@ -25,6 +25,7 @@ wandb:
   entity: null
   tags:
     - babylm-2026-strict
+    - sequence-1024
     - padding-free-packing
     - equal-parameters
   dir: ${oc.env:WANDB_DIR,logs/wandb}

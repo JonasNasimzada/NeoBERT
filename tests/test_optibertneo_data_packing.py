@@ -32,6 +32,16 @@ SPEC.loader.exec_module(preprocess)
 
 
 class TestPaddingFreePacking(unittest.TestCase):
+    def test_expected_source_rows_guard_rejects_partial_corpus(self):
+        source = Dataset.from_dict({"text": ["one", "two", "three"]})
+
+        self.assertIs(
+            preprocess.validate_expected_source_rows(source, 3),
+            source,
+        )
+        with self.assertRaisesRegex(ValueError, "pinned full corpus"):
+            preprocess.validate_expected_source_rows(source, 4)
+
     def test_documents_are_concatenated_without_padding(self):
         source = Dataset.from_dict(
             {
@@ -211,6 +221,7 @@ class TestPaddingFreePacking(unittest.TestCase):
                 dataset,
                 TokenizerStub(),
                 config,
+                source_rows=3,
             )
 
             self.assertTrue((output_path / "dataset_info.json").is_file())
@@ -223,6 +234,7 @@ class TestPaddingFreePacking(unittest.TestCase):
                 )
             )
             self.assertEqual(manifest["rows"], 2)
+            self.assertEqual(manifest["source_rows"], 3)
             self.assertEqual(manifest["sequence_length"], 4)
             self.assertEqual(manifest["packed_token_positions"], 8)
             self.assertTrue(manifest["packing"]["padding_free"])

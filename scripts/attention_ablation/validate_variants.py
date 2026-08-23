@@ -22,7 +22,7 @@ from neobert.model import NeoBERTConfig, NeoBERTLMHead
 
 MODEL_CONFIG_DIR = PROJECT_ROOT / "conf" / "model"
 VOCAB_SIZE = 30_522
-MAX_LENGTH = 512
+MAX_LENGTH = 1024
 EXPECTED_LAYER_PARAMETERS = 1_574_400
 EXPECTED_TRAINABLE_PARAMETERS = 17_260_288
 
@@ -49,6 +49,12 @@ VARIANTS = (
     Variant("dual_native", "attention-ablation-dual.yaml", "dual", "native"),
     Variant("dual_torch", "attention-ablation-dual.yaml", "dual", "torch"),
     Variant("dual_flash", "attention-ablation-dual.yaml", "dual", "flash"),
+    Variant(
+        "dual_flash_fused",
+        "attention-ablation-dual.yaml",
+        "dual",
+        "flash_fused",
+    ),
 )
 
 
@@ -89,7 +95,11 @@ def validate_variants(*, verbose: bool = True) -> dict[str, int]:
             raise AssertionError(f"{variant.name} does not tie input and output embeddings")
 
         layer_counts = [
-            sum(parameter.numel() for parameter in layer.parameters() if parameter.requires_grad)
+            sum(
+                parameter.numel() * (2 if parameter.is_complex() else 1)
+                for parameter in layer.parameters()
+                if parameter.requires_grad
+            )
             for layer in model.model.transformer_encoder
         ]
         if set(layer_counts) != {EXPECTED_LAYER_PARAMETERS}:
@@ -99,7 +109,7 @@ def validate_variants(*, verbose: bool = True) -> dict[str, int]:
             )
 
         count = sum(
-            parameter.numel()
+            parameter.numel() * (2 if parameter.is_complex() else 1)
             for parameter in model.parameters()
             if parameter.requires_grad
         )

@@ -18,8 +18,8 @@ from torch.nn import functional as F
 
 
 EXPECTED_TRAINABLE_PARAMETERS = 17_260_288
-DEFAULT_CONTEXT_LENGTHS = (128, 256, 512)
-DEFAULT_TOKEN_BUDGET = 2_097_152
+DEFAULT_CONTEXT_LENGTHS = (128, 256, 512, 1024)
+DEFAULT_TOKEN_BUDGET = 1_732_608
 DEFAULT_BATCH_TOKENS = 4_096
 VARIANT_MATRIX = {
     "complex-native": ("complex", "native"),
@@ -33,6 +33,7 @@ VARIANT_MATRIX = {
     "dual-native": ("dual", "native"),
     "dual-torch": ("dual", "torch"),
     "dual-flash": ("dual", "flash"),
+    "dual-flash-fused": ("dual", "flash_fused"),
 }
 
 
@@ -508,7 +509,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True, help="Exported final_model directory")
     parser.add_argument("--dataset", type=Path, required=True, help="Prepared DatasetDict directory")
     parser.add_argument("--output", type=Path, required=True, help="Destination JSON report")
-    parser.add_argument("--variant", required=True, help="One of the eleven attention variants")
+    parser.add_argument("--variant", required=True, help="One of the twelve attention variants")
     parser.add_argument("--split", default="validation", help="Held-out DatasetDict split")
     parser.add_argument(
         "--contexts",
@@ -589,9 +590,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # through CUDA autocast during the forward pass.
     model = NeoBERTLMHead.from_pretrained(str(args.model))
     parameter_dtypes = {
-        parameter.dtype
+        parameter.real.dtype if parameter.is_complex() else parameter.dtype
         for parameter in model.parameters()
-        if parameter.is_floating_point()
+        if parameter.is_floating_point() or parameter.is_complex()
     }
     if parameter_dtypes != {torch.float32}:
         dtype_names = ", ".join(sorted(str(dtype) for dtype in parameter_dtypes))
@@ -599,7 +600,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"checkpoint parameters must load in FP32 before BF16 autocast; got {dtype_names}"
         )
     trainable_parameters = sum(
-        parameter.numel()
+        parameter.numel() * (2 if parameter.is_complex() else 1)
         for parameter in model.parameters()
         if parameter.requires_grad
     )

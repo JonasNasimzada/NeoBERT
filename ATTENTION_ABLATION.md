@@ -1,6 +1,6 @@
 # Equal-parameter, equal-token attention-space ablation
 
-This recipe trains eleven homogeneous masked-language models on BabyLM 2026
+This recipe trains twelve homogeneous masked-language models on BabyLM 2026
 Strict. Every encoder layer in a model uses exactly one attention
 space/backend pair.
 
@@ -17,10 +17,13 @@ space/backend pair.
 | 8 | dual number | native | 2,049 | 17,260,288 |
 | 9 | dual number | torch | 2,049 | 17,260,288 |
 | 10 | dual number | flash (hybrid tangent) | 2,049 | 17,260,288 |
+| 11 | dual number | DFlash (`flash_fused`) | 2,049 | 17,260,288 |
 
 Ids 0 through 6 remain unchanged so existing checkpoint paths and submitted
-array tasks keep their original meaning. The new split-Flash and dual variants
-are appended at ids 7 through 10.
+array tasks keep their original meaning. The split-Flash and dual variants are
+appended at ids 7 through 11. Task 11 is the fused dual-number DFlash model; it
+uses the same parameter-matched dual architecture and changes only the backend
+to `flash_fused`.
 
 All models otherwise use 6 layers, width 256, 8 heads, GELU, RoPE, pre-RMSNorm,
 tied input/output embeddings, no bias in the MLM head, and no dropout. The
@@ -34,14 +37,14 @@ wider 2,562-unit FFN to keep the layer and model totals identical.
 ## Packing contract
 
 The preprocessing job concatenates tokenized documents and writes exact
-512-token rows. It drops only the final incomplete tail, so training has no
+1,024-token rows. It drops only the final incomplete tail, so training has no
 padding or unpadding overhead. The same packed rows and deterministic split are
-used by all eleven models.
+used by all twelve models.
 
 The rows intentionally do **not** contain `document_ids`. Direct Flash SDPA
-cannot represent NeoBERT's block-diagonal document mask. Consequently all eleven
+cannot represent NeoBERT's block-diagonal document mask. Consequently all twelve
 runs allow attention across document boundaries inside a packed row. This is
-the controlled eleven-way comparison that includes every direct-Flash variant
+the controlled twelve-way comparison that includes every direct-Flash variant
 without changing the attention semantics for those runs. If
 document boundaries must be isolated, use FlexAttention and treat that as a
 separate experiment; do not label it `flash`.
@@ -51,9 +54,9 @@ separate experiment; do not label it `flash`.
 The common training configuration is:
 
 - BabyLM 2026 Strict, pinned in the dataset config;
-- Google BERT uncased tokenizer, vocabulary 30,522, context 512;
+- Google BERT uncased tokenizer, vocabulary 30,522, context 1,024;
 - 20% MLM masking using NeoBERT's 100%-`[MASK]` corruption;
-- micro-batch 8, gradient accumulation 4, effective batch 32;
+- micro-batch 4, gradient accumulation 4, effective batch 16;
 - AdamW at `6e-4`;
 - BF16 with TF32 enabled;
 - 84,000 optimizer steps and exactly 1,376,256,000 presented token positions per
@@ -62,15 +65,17 @@ The common training configuration is:
 - a W&B training record every 840 steps and deterministic validation/checkpoint
   points every 14,000 steps.
 
-One step always contains 32 packed sequences, or 16,384 token positions. All
-eleven variants therefore run the same number of updates and see the same token
-budget. Doubling the original 42,000-step calibration makes the previously
-calibrated slowest backend an approximately six-hour run; faster backends finish
-earlier. The dual-Flash hybrid is new and uncalibrated, so its dense tangent may
-hit the six-hour guard before step 84,000. Keeping a
+One step always contains 16 packed sequences, or 16,384 token positions. All
+twelve variants therefore run the same number of updates and see the same token
+budget. Relative to the former 512-token setup, halving the sequence batch keeps
+tokens per micro-batch and per optimizer step unchanged. The quadratic
+attention work per presented token nevertheless grows at length 1,024, so the
+previous six-hour calibration no longer applies. The dual-Flash hybrid and
+fused DFlash paths are uncalibrated; the conservative fifteen-hour ceiling keeps
+them comparable without changing the training schedule. Keeping a
 finished fast job idle would not train it further or improve the comparison.
 
-A 21,240-second emergency guard leaves about six minutes before Slurm
+A 53,640-second emergency guard leaves about six minutes before Slurm
 termination. If that guard fires before step 84,000, the W&B run is marked
 incomplete and its dependent benchmark refuses to publish partial results.
 Repeated passes over the packed BabyLM corpus are expected.
@@ -110,9 +115,15 @@ The jobs expect these variables:
 ```bash
 export CONDA_ENV_NAME=attention_dev
 export COMPLEX_ATTENTION_ROOT=/mnt/nfs/home/st171793/ComplexAttention
-export DATASET_PATH=/shared/path/babylm-2026-strict-bert512-flat
+export DATASET_PATH=/shared/path/babylm-2026-strict-bert1024-flat
 export HF_HOME=/shared/path/huggingface-cache
 ```
+
+The held-out MLM benchmark defaults to all 1,732,608 positions in the prepared
+validation split (1,692 rows of 1,024), also exactly 423 complete 4,096-token
+batches. Override it for a different prepared dataset with
+`BENCHMARK_TOKEN_BUDGET`; the value must be divisible by 4,096 and by every
+requested context length.
 
 Prepare the deterministic train/validation `DatasetDict` once on CPU:
 
@@ -122,6 +133,16 @@ sbatch \
   --qos=hiwi_project \
   jobs/attention_ablation/prepare_data.sbatch
 ```
+
+The pinned source is the complete BabyLM 2026 Strict release: 100,000,000
+source tokens in 11,601,896 rows. Preprocessing verifies that row count before
+tokenization, applies no source-token limit, and then reserves 1% of source rows
+for non-leaking validation. Thus the complete release is ingested, with 99% used
+for optimization and 1% used only for held-out metrics. The actual validated
+source-row count is stored in the manifest and checked again by every training
+task. Packing discards only the final incomplete tail of fewer than 1,024
+WordPiece positions in each split. With the pinned source and tokenizer this
+produces 168,236 training rows and 1,692 validation rows.
 
 The output path must not already exist; preprocessing refuses to overwrite it.
 Data download needs a network-enabled job. Training can run with the Hub cache
@@ -139,7 +160,7 @@ The validator resolves the local NeoBERT and ComplexAttention source trees
 itself; it does not require an editable NeoBERT installation or a manual
 `PYTHONPATH`.
 
-Before the full run, launch a two-step eleven-way A100 smoke array:
+Before the full run, launch a two-step twelve-way A100 smoke array:
 
 ```bash
 export SMOKE_RUNS_ROOT=/shared/path/complex-attention-ablation-smoke
@@ -147,21 +168,21 @@ sbatch \
   --partition=slowlane \
   --gpus=A100:1 \
   --qos=hiwi_project \
-  --array=0-10 \
+  --array=0-11 \
   --time=00:20:00 \
-  --export=ALL,RUNS_ROOT="$SMOKE_RUNS_ROOT",EXPERIMENT_ID=smoke-v1,MAX_STEPS=2,WARMUP_STEPS=1,WANDB_MODE=disabled \
+  --export=ALL,RUNS_ROOT="$SMOKE_RUNS_ROOT",EXPERIMENT_ID=smoke-s1024-v1,MAX_STEPS=2,WARMUP_STEPS=1,WANDB_MODE=disabled \
   jobs/attention_ablation/train.sbatch
 ```
 
-To smoke-test only the two newly added Flash paths, use the same command with
-`--array=7,10`. To test all dual-number implementations, use `--array=8-10`.
+To smoke-test only the fused dual-number DFlash model, use the same command with
+`--array=11`. To test all dual-number implementations, use `--array=8-11`.
 
 Set W&B and output locations, then submit the training array and its two
 correlated benchmark arrays:
 
 ```bash
 export RUNS_ROOT=/shared/path/complex-attention-ablation
-export EXPERIMENT_ID=a100-1p376b-v1
+export EXPERIMENT_ID=a100-s1024-1p376b-v1
 export WANDB_PROJECT=complex-attention-ablation
 export WANDB_ENTITY=hyper_attention
 export WANDB_MODE=online
@@ -172,7 +193,7 @@ bash jobs/attention_ablation/submit.sh
 The submission script uses the requested resource command for all arrays:
 
 ```text
-sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-10 ...
+sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-11 ...
 ```
 
 Each training task first checks for an A100, SM80 code, BF16 support, and a
@@ -193,7 +214,9 @@ tokens/s, sequences/s, and peak CUDA memory. Validation corruption is reset to
 the same seed on every evaluation.
 
 The dependent model benchmark evaluates the final export at contexts 128, 256,
-and 512 with deterministic masking and 2,097,152 token positions per context.
+512, and 1,024 with deterministic masking and one fixed token budget per
+context. The default 1,732,608 positions exhausts the prepared validation split
+exactly and is divisible by every context and the 4,096-token batch budget.
 It writes a JSON report, logs all scalar metrics to a W&B `benchmark` run in the
 same group, and uploads the report as an artifact. Memory fields include the
 post-warm-up model baseline, peak allocated and reserved allocator bytes, and
@@ -214,18 +237,24 @@ paper-normalized and algebra-aware TFLOP/s; input bytes; CUDA allocator
 baseline, peak, reserved, and incremental workspace bytes; and an explicit
 `ok`, `unsupported`, `oom`, or `error` status. Results are checkpointed to
 `benchmarks/attention_papers.json`, streamed to a dedicated W&B benchmark run,
-and uploaded as a W&B table and artifact. Strict Flash rows that cannot express
-the paper's padding mask are marked unsupported instead of silently switching
-backend. CUDA allocator peaks are memory footprint measurements, not the HBM
-traffic counter reported by profiler-based figures in the first paper.
+and uploaded as a W&B table and artifact. The Slurm job has a six-hour limit and
+resumes a compatible partial JSON at its first unfinished row, preserving the
+completed prefix and continuing at the matching W&B step. It refuses to combine
+results when the case grid, seed, device/software identity, or W&B destination
+has changed. Strict Flash rows that cannot express the paper's padding mask are
+marked unsupported instead of silently switching backend. CUDA allocator peaks
+are memory footprint measurements, not the HBM traffic counter reported by
+profiler-based figures in the first paper.
 
 Split-complex Flash is one strict packed Flash SDPA call for both idempotent
 channels. Dual-number Flash is deliberately reported as a hybrid: strict Flash
 computes the primal, while an exact dense analytic calculation computes the
 tangent. Its measured time and peak memory include that dense tangent, so it
 does not have FlashAttention's linear-memory scaling and long rows may report
-OOM. The FA1 padding rows and split/dual Flash dropout rows are explicitly
-`unsupported`, never relabeled fallbacks.
+OOM. In contrast, dual DFlash (`flash_fused`) streams both primal and tangent
+through the fused Triton kernel and is the linear-attention-memory comparison
+against `dual-native`. The FA1 padding rows and split/dual Flash dropout rows
+are explicitly `unsupported`, never relabeled fallbacks.
 
 For the official BabyLM zero-shot suite, prepare and pin a checkout of
 `babylm-org/babylm-eval`, download its evaluation data (including any gated
@@ -250,4 +279,5 @@ The `torch` variants permit PyTorch's normal SDPA selection and may themselves
 choose a Flash kernel on A100; the `flash` variants strictly select PyTorch's
 Flash SDPA backend for their Flash-capable core. They do not require the
 external `flash-attn` package. The dual-Flash qualifier above is essential:
-only its primal is Flash, while its tangent remains dense.
+only the hybrid backend's primal is Flash, while its tangent remains dense;
+`flash_fused` is the separate fused DFlash implementation.

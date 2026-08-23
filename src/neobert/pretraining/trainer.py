@@ -68,6 +68,35 @@ def count_batch_tokens(batch: BatchEncoding) -> int:
     return batch["input_ids"].numel()
 
 
+def advance_gradient_accumulation(
+    metrics: Metrics,
+    gradient_accumulation_steps: int,
+) -> bool:
+    """Record one processed microbatch and return whether it ends an update.
+
+    ``train/batches`` deliberately remains the raw dataloader position used to
+    resume within an epoch.  It can also include a short packed batch that is
+    carried to the next dataloader iteration (or discarded at the end of an
+    epoch), so it must not determine gradient-accumulation boundaries.
+
+    Older checkpoints do not contain ``train/processed_batches``.  Checkpoints
+    are written only after optimizer steps, so deriving the missing value from
+    the completed step count restores the correct accumulation phase.
+    """
+    gradient_accumulation_steps = int(gradient_accumulation_steps)
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+
+    if "train/processed_batches" not in metrics:
+        metrics["train/processed_batches"] = (
+            int(metrics["train/steps"]) * gradient_accumulation_steps
+        )
+    metrics["train/processed_batches"] += 1
+    return (
+        metrics["train/processed_batches"] % gradient_accumulation_steps == 0
+    )
+
+
 def split_train_validation_dataset(dataset):
     """Return train/validation datasets while preserving legacy Dataset runs."""
     if not isinstance(dataset, DatasetDict):
@@ -124,6 +153,13 @@ def validate_flat_packed_dataset_dict(dataset, cfg):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("sequence_length") != sequence_length:
         raise ValueError("dataset manifest sequence length does not match the run")
+    expected_source_rows = cfg.dataset.get("expected_source_rows")
+    if expected_source_rows is not None:
+        expected_source_rows = int(expected_source_rows)
+        if manifest.get("source_rows") != expected_source_rows:
+            raise ValueError(
+                "dataset manifest source row count does not match the pinned full corpus"
+            )
     packing = manifest.get("packing", {})
     if packing.get("padding_free") is not True:
         raise ValueError("dataset manifest must declare padding_free=true")
@@ -881,10 +917,15 @@ def trainer(cfg: DictConfig):
                 stored_batch = batch
                 continue
 
+            optimizer_step_batch = advance_gradient_accumulation(
+                metrics,
+                cfg.trainer.gradient_accumulation_steps,
+            )
+
             # Under the no_sync context manager, PyTorch will skip synchronizing the gradients when .backward() is
             # called, and the first call to .backward() outside this context manager will trigger the synchronization.
             # Accumulating manually gives more flexibility and is compatible with TPUs.
-            if metrics["train/batches"] % cfg.trainer.gradient_accumulation_steps != 0:
+            if not optimizer_step_batch:
                 with accelerator.no_sync(model):
                     # Forward pass
                     logits = model(
