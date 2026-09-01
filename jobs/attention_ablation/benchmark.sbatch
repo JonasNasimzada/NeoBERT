@@ -8,7 +8,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=03:00:00
+#SBATCH --time=15:00:00
 #SBATCH --output=ca-babylm-eval-%A_%a.out
 #SBATCH --error=ca-babylm-eval-%A_%a.err
 
@@ -30,9 +30,8 @@ source "$job_dir/common.sh"
 resolve_attention_variant "${SLURM_ARRAY_TASK_ID:?This job must run as an array task.}"
 setup_attention_runtime
 
-DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-1p376b-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-multispace-100m-v4}"
 SEED="${SEED:-42}"
 BENCHMARK_TOKEN_BUDGET="${BENCHMARK_TOKEN_BUDGET:-1732608}"
 validate_experiment_id "$EXPERIMENT_ID"
@@ -52,18 +51,23 @@ mkdir -p "$BENCHMARK_ROOT" "${WANDB_DIR:-$RUNS_ROOT/wandb}"
 export WANDB_DIR="${WANDB_DIR:-$RUNS_ROOT/wandb}"
 cd "$NEOBERT_ROOT"
 
-"$COMPLEX_ATTN_PYTHON" scripts/attention_ablation/benchmark_mlm.py \
-    --model "$MODEL_PATH" \
-    --dataset "$DATASET_PATH" \
-    --output "$BENCHMARK_ROOT/heldout_mlm.json" \
-    --variant "$ATTENTION_VARIANT" \
-    --seed "$SEED" \
-    --token-budget "$BENCHMARK_TOKEN_BUDGET" \
-    --id-prefix "$EXPERIMENT_ID" \
-    --project "${WANDB_PROJECT:-complex-attention-ablation}" \
-    --entity "${WANDB_ENTITY:-hyper_attention}" \
-    --group "$WANDB_GROUP" \
-    --mode "${WANDB_MODE:-online}"
+if [[ "${SKIP_HELDOUT_MLM:-0}" != "1" ]]; then
+    DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
+    "$COMPLEX_ATTN_PYTHON" scripts/attention_ablation/benchmark_mlm.py \
+        --model "$MODEL_PATH" \
+        --dataset "$DATASET_PATH" \
+        --output "$BENCHMARK_ROOT/heldout_mlm.json" \
+        --variant "$ATTENTION_VARIANT" \
+        --seed "$SEED" \
+        --token-budget "$BENCHMARK_TOKEN_BUDGET" \
+        --id-prefix "$EXPERIMENT_ID" \
+        --project "${WANDB_PROJECT:-complex-attention-ablation}" \
+        --entity "${WANDB_ENTITY:-hyper_attention}" \
+        --group "$WANDB_GROUP" \
+        --mode "${WANDB_MODE:-online}"
+else
+    echo "SKIP_HELDOUT_MLM=1; held-out MLM benchmark skipped."
+fi
 
 # Optional official suite. Clone/pin babylm-org/babylm-eval and prepare its
 # gated evaluation data outside this job, then export BABYLM_EVAL_ROOT.
@@ -96,12 +100,20 @@ if [[ -n "${BABYLM_EVAL_ROOT:-}" ]]; then
     (
         cd "$eval_workdir"
         export NEOBERT_BABYLM_FORCE_BF16=1
-        export PYTHONPATH="$NEOBERT_ROOT/scripts/attention_ablation/babylm_compat:$PYTHONPATH"
+        export NEOBERT_BABYLM_SEED="$SEED"
+        babylm_eval_deps="${BABYLM_EVAL_DEPS:-$BABYLM_EVAL_ROOT/.eval_deps}"
+        if [[ ! -d "$babylm_eval_deps" ]]; then
+            echo "BabyLM evaluator dependency overlay is missing: $babylm_eval_deps" >&2
+            exit 2
+        fi
+        export PYTHONPATH="$NEOBERT_ROOT/scripts/attention_ablation/babylm_compat:$babylm_eval_deps:$PYTHONPATH"
         "$COMPLEX_ATTN_PYTHON" \
             "$NEOBERT_ROOT/scripts/attention_ablation/run_with_resource_monitor.py" \
             --output "$resource_report" \
             --sample-interval "${BENCHMARK_MEMORY_SAMPLE_INTERVAL:-0.25}" \
-            -- bash -e "$eval_script" "$official_model_path" mlm \
+            -- bash -e \
+            "$NEOBERT_ROOT/scripts/attention_ablation/run_babylm_official.sh" \
+            "$eval_script" "$official_model_path" \
             "${BABYLM_EVAL_DATA:-evaluation_data/full_eval}"
     )
 

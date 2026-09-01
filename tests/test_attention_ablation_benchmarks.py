@@ -68,6 +68,14 @@ class TestVariantMatrix(unittest.TestCase):
             ("real", "flash"),
         )
         self.assertEqual(
+            benchmark_mlm.canonical_variant("REAL_100M_FLASH"),
+            "real-100m-flash",
+        )
+        self.assertEqual(
+            benchmark_mlm.VARIANT_MATRIX["real-100m-flash"],
+            ("real", "flash"),
+        )
+        self.assertEqual(
             benchmark_mlm.canonical_variant("SPLIT_FLASH"),
             "split-flash",
         )
@@ -84,13 +92,59 @@ class TestVariantMatrix(unittest.TestCase):
             ("dual", "flash"),
         )
         self.assertEqual(
-            benchmark_mlm.canonical_variant("DUAL_FLASH_FUSED"),
-            "dual-flash-fused",
+            benchmark_mlm.canonical_variant("MULTISPACE_FLASH"),
+            "multispace-flash",
         )
         self.assertEqual(
-            benchmark_mlm.VARIANT_MATRIX["dual-flash-fused"],
-            ("dual", "flash_fused"),
+            benchmark_mlm.VARIANT_MATRIX["multispace-flash"],
+            ("multispace", "flash"),
         )
+        self.assertEqual(
+            benchmark_mlm.expected_variant_schedule("multispace-flash", 9),
+            (
+                ("multispace",) * 9,
+                ("flash",) * 9,
+            ),
+        )
+        self.assertEqual(
+            benchmark_mlm.expected_variant_schedule("multispace-flash", 3),
+            (("multispace",) * 3, ("flash",) * 3),
+        )
+        self.assertEqual(
+            benchmark_mlm.expected_trainable_parameters("complex-native"),
+            17_260_288,
+        )
+        self.assertEqual(
+            benchmark_mlm.expected_trainable_parameters("multispace-flash"),
+            99_985_152,
+        )
+        self.assertEqual(
+            benchmark_mlm.expected_trainable_parameters("real-flash"),
+            17_260_288,
+        )
+        self.assertEqual(
+            benchmark_mlm.expected_trainable_parameters("real-100m-flash"),
+            99_985_152,
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "checkpoint uses attention spaces",
+        ):
+            benchmark_mlm.validate_variant_schedule(
+                "multispace-flash",
+                (
+                    "split",
+                    "multispace",
+                    "multispace",
+                    "multispace",
+                    "multispace",
+                    "multispace",
+                    "multispace",
+                    "multispace",
+                    "multispace",
+                ),
+                ("flash",) * 9,
+            )
         self.assertEqual(
             set(benchmark_mlm.VARIANT_MATRIX),
             {
@@ -101,11 +155,12 @@ class TestVariantMatrix(unittest.TestCase):
                 "split-torch",
                 "real-torch",
                 "real-flash",
+                "real-100m-flash",
                 "split-flash",
                 "dual-native",
                 "dual-torch",
                 "dual-flash",
-                "dual-flash-fused",
+                "multispace-flash",
             },
         )
 
@@ -146,6 +201,28 @@ class TestBenchmarkMemoryMetrics(unittest.TestCase):
         self.assertEqual(metrics["peak_memory_bytes"], 900)
         self.assertEqual(metrics["peak_memory_reserved_bytes"], 1200)
         self.assertEqual(metrics["device_total_memory_bytes"], 80 * 2**30)
+
+
+class TestMLMQualityMetrics(unittest.TestCase):
+    def test_quality_aggregate_is_weighted_by_masked_tokens(self):
+        aggregate = benchmark_mlm.aggregate_quality_metrics(
+            {
+                "128": {
+                    "masked_tokens": 2,
+                    "masked_token_correct": 1,
+                    "mlm_cross_entropy_loss": 2.0,
+                },
+                "1024": {
+                    "masked_tokens": 3,
+                    "masked_token_correct": 2,
+                    "mlm_cross_entropy_loss": 4.0,
+                },
+            }
+        )
+
+        self.assertEqual(aggregate["masked_token_evaluations"], 5)
+        self.assertEqual(aggregate["mlm_cross_entropy_loss"], 3.2)
+        self.assertEqual(aggregate["masked_token_top1_accuracy"], 0.6)
 
 
 class ListDataset:
@@ -332,6 +409,47 @@ class TestBabyLMResultParsing(unittest.TestCase):
             "finetune.txt",
         )
 
+    def test_report_sections_disambiguate_and_normalize_official_accuracy(self):
+        parsed = log_babylm_results.parse_key_value_report(
+            "### FIELD ACCURACY\n"
+            "supplement: 62.50\n"
+            "### LINGUISTICS TERM ACCURACY\n"
+            "supplement: 75.00\n"
+            "### AVERAGE ACCURACY\n"
+            "68.75\n"
+        )
+
+        self.assertEqual(parsed[("field_accuracy", "supplement")], 0.625)
+        self.assertEqual(
+            parsed[("linguistics_term_accuracy", "supplement")],
+            0.75,
+        )
+        self.assertEqual(parsed[("average_accuracy",)], 0.6875)
+
+    def test_distinct_report_labels_survive_normalization_collisions(self):
+        parsed = log_babylm_results.parse_key_value_report(
+            "### CONTEXT CONTRAST ACCURACY\n"
+            "variable swap: 49.77\n"
+            "variable_swap: 63.33\n"
+        )
+
+        self.assertAlmostEqual(
+            parsed[("context_contrast_accuracy", "variable_swap")],
+            0.4977,
+        )
+        self.assertAlmostEqual(
+            parsed[("context_contrast_accuracy", "variable_swap_2")],
+            0.6333,
+        )
+
+    def test_genuinely_repeated_report_key_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "duplicate report key"):
+            log_babylm_results.parse_key_value_report(
+                "### UID ACCURACY\n"
+                "same key: 50.00\n"
+                "same key: 51.00\n"
+            )
+
     def test_resource_report_is_logged_under_system_namespace(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             report = Path(temporary_directory) / "resources.json"
@@ -423,6 +541,7 @@ class TestBabyLMResultParsing(unittest.TestCase):
             benchmark_report = {
                 "trainable_parameters": 17_260_288,
                 "training_completion": {"status": "complete"},
+                "quality_aggregate": {},
                 "results": {},
             }
             babylm_args = types.SimpleNamespace(
@@ -454,7 +573,7 @@ class TestBabyLMResultParsing(unittest.TestCase):
 
 
 class TestBabyLMFlashCompatibility(unittest.TestCase):
-    def test_padded_batch_is_evaluated_as_padding_free_rows(self):
+    def test_padded_batch_is_evaluated_in_padding_free_length_groups(self):
         class FakeFlashModel(torch.nn.Module):
             def __init__(self, backend):
                 super().__init__()
@@ -472,8 +591,12 @@ class TestBabyLMFlashCompatibility(unittest.TestCase):
                 logits = input_ids.unsqueeze(-1).expand(*input_ids.shape, 5).float()
                 return types.SimpleNamespace(logits=logits)
 
-        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
-        attention_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+        input_ids = torch.tensor(
+            [[1, 2, 3, 0], [4, 5, 0, 0], [6, 7, 8, 0]]
+        )
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 0], [1, 1, 0, 0], [1, 1, 1, 0]]
+        )
 
         for backend in ("flash", "flash_fused"):
             with self.subTest(backend=backend):
@@ -482,10 +605,10 @@ class TestBabyLMFlashCompatibility(unittest.TestCase):
                 )
                 output = model(input_ids=input_ids, attention_mask=attention_mask)
 
-                self.assertEqual(tuple(output.logits.shape), (2, 4, 5))
+                self.assertEqual(tuple(output.logits.shape), (3, 4, 5))
                 self.assertEqual(
                     [shape for shape, _ in model.calls],
-                    [(1, 3), (1, 2)],
+                    [(2, 3), (1, 2)],
                 )
                 self.assertTrue(all(mask is None for _, mask in model.calls))
                 torch.testing.assert_close(
@@ -494,12 +617,16 @@ class TestBabyLMFlashCompatibility(unittest.TestCase):
                 torch.testing.assert_close(
                     output.logits[1, :2, 0], input_ids[1, :2].float()
                 )
+                torch.testing.assert_close(
+                    output.logits[2, :3, 0], input_ids[2, :3].float()
+                )
                 self.assertTrue(output.logits[0, 3].eq(0).all())
                 self.assertTrue(output.logits[1, 2:].eq(0).all())
+                self.assertTrue(output.logits[2, 3].eq(0).all())
 
                 model.calls.clear()
                 model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
-                self.assertEqual(model.calls, [((2, 4), None)])
+                self.assertEqual(model.calls, [((3, 4), None)])
 
 
 if __name__ == "__main__":

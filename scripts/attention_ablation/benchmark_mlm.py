@@ -18,6 +18,7 @@ from torch.nn import functional as F
 
 
 EXPECTED_TRAINABLE_PARAMETERS = 17_260_288
+MULTISPACE_EXPECTED_TRAINABLE_PARAMETERS = 99_985_152
 DEFAULT_CONTEXT_LENGTHS = (128, 256, 512, 1024)
 DEFAULT_TOKEN_BUDGET = 1_732_608
 DEFAULT_BATCH_TOKENS = 4_096
@@ -29,11 +30,14 @@ VARIANT_MATRIX = {
     "split-torch": ("split", "torch"),
     "real-torch": ("real", "torch"),
     "real-flash": ("real", "flash"),
+    # Keep the original 17.26M real-flash benchmark contract above intact.
+    # This name identifies the exactly parameter-matched 99.99M FineWeb control.
+    "real-100m-flash": ("real", "flash"),
     "split-flash": ("split", "flash"),
     "dual-native": ("dual", "native"),
     "dual-torch": ("dual", "torch"),
     "dual-flash": ("dual", "flash"),
-    "dual-flash-fused": ("dual", "flash_fused"),
+    "multispace-flash": ("multispace", "flash"),
 }
 
 
@@ -43,6 +47,60 @@ def canonical_variant(value: str) -> str:
         choices = ", ".join(VARIANT_MATRIX)
         raise ValueError(f"unknown variant {value!r}; expected one of: {choices}")
     return variant
+
+
+def expected_trainable_parameters(variant: str) -> int:
+    return (
+        MULTISPACE_EXPECTED_TRAINABLE_PARAMETERS
+        if canonical_variant(variant) in {"multispace-flash", "real-100m-flash"}
+        else EXPECTED_TRAINABLE_PARAMETERS
+    )
+
+
+def expected_variant_schedule(
+    variant: str,
+    num_hidden_layers: int,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Expand a variant specification into exact layer schedules."""
+    space_spec, backend_spec = VARIANT_MATRIX[variant]
+
+    def expand(value: str | Sequence[str], name: str) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return (value,) * num_hidden_layers
+        schedule = tuple(value)
+        if len(schedule) != num_hidden_layers:
+            raise AssertionError(
+                f"{variant} {name} has {len(schedule)} entries for "
+                f"{num_hidden_layers} hidden layers"
+            )
+        return schedule
+
+    return expand(space_spec, "space schedule"), expand(
+        backend_spec,
+        "backend schedule",
+    )
+
+
+def validate_variant_schedule(
+    variant: str,
+    attention_spaces: Sequence[str],
+    attention_backends: Sequence[str],
+) -> None:
+    """Require the checkpoint to match the variant's exact ordered schedule."""
+    expected_spaces, expected_backends = expected_variant_schedule(
+        variant,
+        len(attention_spaces),
+    )
+    if tuple(attention_spaces) != expected_spaces:
+        raise AssertionError(
+            f"{variant} checkpoint uses attention spaces {list(attention_spaces)}, "
+            f"expected {list(expected_spaces)}"
+        )
+    if tuple(attention_backends) != expected_backends:
+        raise AssertionError(
+            f"{variant} checkpoint uses attention backends {list(attention_backends)}, "
+            f"expected {list(expected_backends)}"
+        )
 
 
 def validate_training_completion(
@@ -291,6 +349,29 @@ def cuda_memory_metrics(
     }
 
 
+def aggregate_quality_metrics(results: Mapping[str, Mapping]) -> dict[str, int | float]:
+    """Token-weight MLM quality across all evaluated context lengths."""
+    masked_token_evaluations = sum(
+        int(metrics["masked_tokens"]) for metrics in results.values()
+    )
+    if masked_token_evaluations <= 0:
+        raise ValueError("cannot aggregate MLM quality without masked tokens")
+    loss_sum = sum(
+        float(metrics["mlm_cross_entropy_loss"])
+        * int(metrics["masked_tokens"])
+        for metrics in results.values()
+    )
+    correct_sum = sum(
+        int(metrics["masked_token_correct"]) for metrics in results.values()
+    )
+    return {
+        "context_count": len(results),
+        "masked_token_evaluations": masked_token_evaluations,
+        "mlm_cross_entropy_loss": loss_sum / masked_token_evaluations,
+        "masked_token_top1_accuracy": correct_sum / masked_token_evaluations,
+    }
+
+
 def evaluate_context(
     model,
     dataset,
@@ -387,6 +468,10 @@ def evaluate_context(
         "eligible_tokens": eligible_tokens,
         "masked_tokens": masked_tokens,
         "masked_fraction": masked_tokens / eligible_tokens,
+        "mlm_cross_entropy_loss": mean_loss,
+        "masked_token_top1_accuracy": accuracy,
+        "masked_token_correct": int(correct_sum.item()),
+        # Compatibility aliases retained for existing reports and dashboards.
         "loss": mean_loss,
         "perplexity": perplexity,
         "accuracy": accuracy,
@@ -478,6 +563,9 @@ def _log_to_wandb(report: Mapping, output_path: Path, args) -> None:
             for name, value in metrics.items():
                 if isinstance(value, (int, float)):
                     scalars[f"{prefix}/{name}"] = value
+        for name, value in report["quality_aggregate"].items():
+            if isinstance(value, (int, float)):
+                scalars[f"benchmark/mlm/aggregate/{name}"] = value
         if report["results"]:
             result_values = tuple(report["results"].values())
             for metric_name in (
@@ -509,7 +597,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", type=Path, required=True, help="Exported final_model directory")
     parser.add_argument("--dataset", type=Path, required=True, help="Prepared DatasetDict directory")
     parser.add_argument("--output", type=Path, required=True, help="Destination JSON report")
-    parser.add_argument("--variant", required=True, help="One of the twelve attention variants")
+    parser.add_argument("--variant", required=True, help="A registered attention variant")
     parser.add_argument("--split", default="validation", help="Held-out DatasetDict split")
     parser.add_argument(
         "--contexts",
@@ -604,23 +692,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         for parameter in model.parameters()
         if parameter.requires_grad
     )
-    if trainable_parameters != EXPECTED_TRAINABLE_PARAMETERS:
+    expected_parameters = expected_trainable_parameters(args.variant)
+    if trainable_parameters != expected_parameters:
         raise AssertionError(
             f"checkpoint has {trainable_parameters:,} trainable parameters; "
-            f"expected {EXPECTED_TRAINABLE_PARAMETERS:,}"
+            f"expected {expected_parameters:,}"
         )
     if model.decoder.weight is not model.model.encoder.weight:
         raise AssertionError("checkpoint input and output embeddings are not tied")
 
-    expected_space, expected_backend = VARIANT_MATRIX[args.variant]
-    if set(model.config.attention_spaces) != {expected_space}:
-        raise AssertionError(
-            f"{args.variant} checkpoint does not use only {expected_space} attention"
-        )
-    if set(model.config.attention_backends) != {expected_backend}:
-        raise AssertionError(
-            f"{args.variant} checkpoint does not use only {expected_backend} backend"
-        )
+    validate_variant_schedule(
+        args.variant,
+        model.config.attention_spaces,
+        model.config.attention_backends,
+    )
     if max(args.contexts) > model.config.max_length:
         raise ValueError("requested context exceeds checkpoint max_length")
     if len(tokenizer) != model.config.vocab_size:
@@ -646,17 +731,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         results[str(context_length)] = metrics
         print(
-            f"context={context_length}: loss={metrics['loss']:.6f}, "
+            f"context={context_length}: "
+            f"mlm_cross_entropy_loss={metrics['mlm_cross_entropy_loss']:.6f}, "
             f"ppl={metrics['perplexity']:.3f}, "
-            f"accuracy={metrics['accuracy']:.4f}, "
+            f"masked_token_top1_accuracy={metrics['masked_token_top1_accuracy']:.4f}, "
             f"tokens/s={metrics['tokens_per_second']:,.1f}, "
             f"peak_allocated={metrics['peak_cuda_memory_allocated_bytes'] / 2**30:.2f} GiB, "
             f"peak_reserved={metrics['peak_cuda_memory_reserved_bytes'] / 2**30:.2f} GiB, "
             f"workspace={metrics['peak_cuda_workspace_allocated_bytes'] / 2**30:.2f} GiB"
         )
 
+    quality_aggregate = aggregate_quality_metrics(results)
+    print(
+        "aggregate: "
+        f"mlm_cross_entropy_loss={quality_aggregate['mlm_cross_entropy_loss']:.6f}, "
+        "masked_token_top1_accuracy="
+        f"{quality_aggregate['masked_token_top1_accuracy']:.4f}"
+    )
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "benchmark": "heldout_mlm",
         "variant": args.variant,
         "model": str(args.model.resolve()),
@@ -671,10 +764,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "device": torch.cuda.get_device_name(device),
         "seed": args.seed,
         "mask_probability": args.mask_probability,
+        "quality_metric_definitions": {
+            "mlm_cross_entropy_loss": (
+                "Mean negative natural-log probability of the original token "
+                "over deterministically masked, non-special positions; lower is better."
+            ),
+            "masked_token_top1_accuracy": (
+                "Fraction of masked positions whose highest-logit vocabulary token "
+                "is the original token; higher is better."
+            ),
+        },
         "token_budget_per_context": args.token_budget,
         "batch_tokens": args.batch_tokens,
         "trainable_parameters": trainable_parameters,
         "training_completion": training_completion,
+        "quality_aggregate": quality_aggregate,
         "results": results,
     }
     _atomic_write_json(args.output, report)

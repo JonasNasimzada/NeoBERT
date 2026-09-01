@@ -16,6 +16,7 @@ VALID_BACKENDS = {
     "complex": {"native", "torch", "flash"},
     "split": {"native", "torch", "flash"},
     "dual": {"native", "torch", "flash", "flash_fused"},
+    "multispace": {"flash"},
 }
 
 
@@ -51,11 +52,17 @@ def main() -> None:
 
     torch.manual_seed(1234)
     torch.cuda.manual_seed_all(1234)
+    # One layer is sufficient for the backend preflight. A multispace layer
+    # internally executes all three equal-sized algebra head groups.
+    attention_spaces = (args.space,)
+    attention_backends = (args.backend,) * len(attention_spaces)
+    hidden_size = 96 if args.space == "multispace" else 32
+    num_attention_heads = 3 if args.space == "multispace" else 4
     config = NeoBERTConfig(
-        hidden_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        intermediate_size=64,
+        hidden_size=hidden_size,
+        num_hidden_layers=len(attention_spaces),
+        num_attention_heads=num_attention_heads,
+        intermediate_size=hidden_size * 2,
         hidden_act="gelu",
         vocab_size=128,
         max_length=16,
@@ -66,8 +73,10 @@ def main() -> None:
         lm_head_bias=False,
         dropout=0.0,
         attention_dropout=0.0,
-        attention_space=args.space,
+        attention_space=attention_spaces[0],
         attention_backend=args.backend,
+        attention_spaces=list(attention_spaces),
+        attention_backends=list(attention_backends),
     )
     model = NeoBERTLMHead(config).cuda().train()
     input_ids = torch.randint(0, config.vocab_size, (2, 16), device="cuda")
@@ -101,6 +110,8 @@ def main() -> None:
             {
                 "space": args.space,
                 "backend": args.backend,
+                "attention_spaces": list(attention_spaces),
+                "attention_backends": list(attention_backends),
                 "device": device_name,
                 "capability": capability,
                 "torch": torch.__version__,

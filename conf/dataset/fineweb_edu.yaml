@@ -2,11 +2,19 @@ name: fineweb_edu
 column: text
 path_to_disk: tokenized_datasets/fineweb_edu_roberta_1p6b
 approx_token_limit: 1600000000
+expected_source_rows: 9672101
 pack_to_length: 1024
+cross_document_attention: false
+validation_fraction: null
 minimum_packed_rows: 1269760
 require_manifest: true
+training_schedule:
+  optimizer_steps: 620
+  global_sequences: 2048
+  required_token_positions: 1300234240
 train:
   path: HuggingFaceFW/fineweb-edu
   name: sample-10BT
   split: train
-  revision: v1.0.0
+  # Immutable commit behind the v1.0.0 branch when this recipe was built.
+  revision: fc9850dff5e2d0f8f776efe41b24a1c49556cfc5

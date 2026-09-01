@@ -1,8 +1,11 @@
-# Equal-parameter, equal-token attention-space ablation
+# Equal-token attention-space ablation
 
-This recipe trains twelve homogeneous masked-language models on BabyLM 2026
-Strict. Every encoder layer in a model uses exactly one attention
-space/backend pair.
+This recipe trains twelve masked-language models on BabyLM 2026 Strict. The
+first eleven models are homogeneous: every encoder layer uses exactly one
+attention space/backend pair. The twelfth is a larger multispace model. Each of
+its nine encoder layers divides standard MHA head slots equally among
+ordinary-complex, split-complex, and dual-number FlashAttention, then combines
+the three groups through the usual concatenation and output projection.
 
 | Array id | Attention space | Backend | FFN width | Trainable parameters |
 | ---: | --- | --- | ---: | ---: |
@@ -16,23 +19,54 @@ space/backend pair.
 | 7 | split complex | flash | 2,049 | 17,260,288 |
 | 8 | dual number | native | 2,049 | 17,260,288 |
 | 9 | dual number | torch | 2,049 | 17,260,288 |
-| 10 | dual number | flash (hybrid tangent) | 2,049 | 17,260,288 |
-| 11 | dual number | DFlash (`flash_fused`) | 2,049 | 17,260,288 |
+| 10 | dual number | fused DFlash (`flash`) | 2,049 | 17,260,288 |
+| 11 | multispace: 4 complex + 4 split + 4 dual heads per layer | flash | 2,464 | 99,985,152 |
 
-Ids 0 through 6 remain unchanged so existing checkpoint paths and submitted
-array tasks keep their original meaning. The split-Flash and dual variants are
-appended at ids 7 through 11. Task 11 is the fused dual-number DFlash model; it
-uses the same parameter-matched dual architecture and changes only the backend
-to `flash_fused`.
+Ids 0 through 10 remain unchanged so existing checkpoint paths and submitted
+array tasks keep their original meaning. Task 10 is the fused dual-number
+DFlash model; it uses the same parameter-matched dual architecture with backend
+`flash`. Those eleven controls use 6 layers, width 256, 8 heads, and exactly
+17,260,288 trainable parameters. Their real-valued attention projections use
+fewer parameters, so tasks 5 and 6 use the wider 2,562-unit FFN to preserve
+exact per-layer and model parameter equality within tasks 0 through 10.
 
-All models otherwise use 6 layers, width 256, 8 heads, GELU, RoPE, pre-RMSNorm,
-tied input/output embeddings, no bias in the MLM head, and no dropout. The
-parameter equality is exact; the validator checks both the total and every
-encoder layer before a sweep.
+Task 11 is `multispace-flash`: 9 layers, hidden width `H = 768`, 12 heads of
+dimension 64, and GELU FFN width `I = 2,464`. Every layer assigns four head
+slots to each algebra. A bias-free packed `H`-to-`6H` projection contains a
+separate pair-valued Q/K/V slice for each 256-wide head group. RoPE is applied
+to the group Q/K pairs, and ordinary-complex FlashAttention, packed
+split-complex FlashAttention, and fused dual-number DFlash process their own
+four-head slices.
 
-This is parameter and token matching, not wall-time or FLOP matching. The
-real-valued attention projections use fewer parameters, so their models use the
-wider 2,562-unit FFN to keep the layer and model totals identical.
+Each algebra returns both scalar components for its four heads, and neither
+component is averaged or reduced. Concatenating the complex pair, split pair,
+and dual pair produces 24 component-head channels: `24 × 64 = 1,536 = 2H`.
+One shared real output projection, `W_o = Linear(1536, 768)`, then maps those
+channels back to the residual stream. There are no readout parameters,
+branch-fusion logits, softmax gates, or per-group output projections.
+
+The task-11 attention module therefore has `6H²` QKV parameters and `2H²`
+output-projection parameters:
+
+```text
+8H² = 4,718,592 attention parameters
+```
+
+With its two RMSNorms and `H → I → H` GELU FFN, each encoder layer has
+8,504,832 parameters. Nine layers, the tied 30,522-by-768 token embedding, and
+the final RMSNorm give exactly 99,985,152 scalar-equivalent trainable
+parameters.
+
+The three algebra kernels are sibling group computations in the layer graph.
+Complex attention remains on the caller stream while split and dual attention
+run on two persistent side streams shared by all layers. Both streams rejoin
+before head concatenation; `multispace_cuda_streams: false` restores the serial
+GPU path for an execution-schedule ablation.
+
+All twelve tasks match optimizer updates, token positions, data, and training
+schedule. Task 11 is deliberately not parameter-, FLOP-, or wall-time-matched
+to tasks 0 through 10. All models use GELU, RoPE, pre-RMSNorm, tied input/output
+embeddings, no bias in the MLM head, and no dropout.
 
 ## Packing contract
 
@@ -70,9 +104,9 @@ twelve variants therefore run the same number of updates and see the same token
 budget. Relative to the former 512-token setup, halving the sequence batch keeps
 tokens per micro-batch and per optimizer step unchanged. The quadratic
 attention work per presented token nevertheless grows at length 1,024, so the
-previous six-hour calibration no longer applies. The dual-Flash hybrid and
-fused DFlash paths are uncalibrated; the conservative fifteen-hour ceiling keeps
-them comparable without changing the training schedule. Keeping a
+previous six-hour calibration no longer applies. The fused DFlash path and the
+100M-parameter multispace model are uncalibrated; the conservative fifteen-hour
+ceiling keeps the runs comparable without changing the training schedule. Keeping a
 finished fast job idle would not train it further or improve the comparison.
 
 A 53,640-second emergency guard leaves about six minutes before Slurm
@@ -170,19 +204,20 @@ sbatch \
   --qos=hiwi_project \
   --array=0-11 \
   --time=00:20:00 \
-  --export=ALL,RUNS_ROOT="$SMOKE_RUNS_ROOT",EXPERIMENT_ID=smoke-s1024-v1,MAX_STEPS=2,WARMUP_STEPS=1,WANDB_MODE=disabled \
+  --export=ALL,RUNS_ROOT="$SMOKE_RUNS_ROOT",EXPERIMENT_ID=smoke-s1024-multispace-100m-v4,MAX_STEPS=2,WARMUP_STEPS=1,WANDB_MODE=disabled \
   jobs/attention_ablation/train.sbatch
 ```
 
 To smoke-test only the fused dual-number DFlash model, use the same command with
-`--array=11`. To test all dual-number implementations, use `--array=8-11`.
+`--array=10`. To test the multispace model, use `--array=11`. To test all
+dual-number implementations, use `--array=8-10`.
 
 Set W&B and output locations, then submit the training array and its two
 correlated benchmark arrays:
 
 ```bash
 export RUNS_ROOT=/shared/path/complex-attention-ablation
-export EXPERIMENT_ID=a100-s1024-1p376b-v1
+export EXPERIMENT_ID=a100-s1024-multispace-100m-v4
 export WANDB_PROJECT=complex-attention-ablation
 export WANDB_ENTITY=hyper_attention
 export WANDB_MODE=online
@@ -190,11 +225,22 @@ export WANDB_MODE=online
 bash jobs/attention_ablation/submit.sh
 ```
 
-The submission script uses the requested resource command for all arrays:
+The `multispace-100m-v4` experiment ids intentionally separate the new task-11
+geometry and head-group topology from all earlier combined/shared-projection
+runs. Do not reuse an older experiment id or run directory: those task-11
+checkpoints have incompatible shapes and state dictionaries.
+
+The submission script uses tasks 0 through 11 for training and the held-out
+model benchmark:
 
 ```text
 sbatch --partition=slowlane --gpus=A100:1 --qos=hiwi_project --array=0-11 ...
 ```
+
+The raw FlashAttention-paper benchmark remains tasks 0 through 10. It measures
+one attention primitive at a time, so there is no honest single-kernel row for
+the multispace task-11 layer; its three constituent algebra kernels are already
+measured by tasks 2, 7, and 10.
 
 Each training task first checks for an A100, SM80 code, BF16 support, and a
 finite forward/backward step for its chosen backend. Outputs are written below
@@ -247,14 +293,17 @@ are memory footprint measurements, not the HBM traffic counter reported by
 profiler-based figures in the first paper.
 
 Split-complex Flash is one strict packed Flash SDPA call for both idempotent
-channels. Dual-number Flash is deliberately reported as a hybrid: strict Flash
-computes the primal, while an exact dense analytic calculation computes the
-tangent. Its measured time and peak memory include that dense tangent, so it
-does not have FlashAttention's linear-memory scaling and long rows may report
-OOM. In contrast, dual DFlash (`flash_fused`) streams both primal and tangent
-through the fused Triton kernel and is the linear-attention-memory comparison
-against `dual-native`. The FA1 padding rows and split/dual Flash dropout rows
-are explicitly `unsupported`, never relabeled fallbacks.
+channels. Dual-number Flash is fused DFlash: it streams both primal and tangent
+through the Triton kernel and is the linear-attention-memory comparison against
+`dual-native`. The FA1 padding rows and split/dual Flash dropout rows are
+explicitly `unsupported`, never relabeled fallbacks.
+
+The multispace model uses those same ordinary-complex, split-complex, and
+dual-number Flash implementations for its four-head groups. It does not
+introduce a fourth attention kernel. All six 256-wide scalar-component groups
+are retained and concatenated to width 1,536 before one shared `W_o` maps the
+result to width 768. Its 99,985,152-parameter total is not matched to the
+17,260,288-parameter controls.
 
 For the official BabyLM zero-shot suite, prepare and pin a checkout of
 `babylm-org/babylm-eval`, download its evaluation data (including any gated
@@ -276,8 +325,8 @@ preserves the selected Flash backend and avoids silently falling back to Torch
 SDPA.
 
 The `torch` variants permit PyTorch's normal SDPA selection and may themselves
-choose a Flash kernel on A100; the `flash` variants strictly select PyTorch's
-Flash SDPA backend for their Flash-capable core. They do not require the
-external `flash-attn` package. The dual-Flash qualifier above is essential:
-only the hybrid backend's primal is Flash, while its tangent remains dense;
-`flash_fused` is the separate fused DFlash implementation.
+choose a Flash kernel on A100. The real, ordinary-complex, and split-complex
+`flash` variants strictly select PyTorch's Flash SDPA backend; dual `flash`
+selects the fused Triton DFlash kernel. None require the external `flash-attn`
+package. The former dual `flash_fused` spelling remains a compatibility alias,
+but it is not a separate ablation variant.

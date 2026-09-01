@@ -1,0 +1,57 @@
+# BabyLM 2026 Strict suite used only as an external FineWeb-Edu diagnostic.
+eligibility: external_non_leaderboard
+eligibility_reason: >-
+  These checkpoints were pretrained on FineWeb-Edu with 1,376,256,000 token
+  positions, not within the BabyLM Strict 100M-word training budget.
+
+evaluator:
+  repository: https://github.com/babylm-org/babylm-eval
+  commit: 6f825c291e2c4c78ad33b1935fd64d45f52642dc
+  root: /mnt/nfs/home/st171793/babylm-eval-2026
+
+data:
+  core_repository: BabyLM-community/BabyLM-2026-Strict-Evals
+  core_revision: 8d52da9424a9ff30b9e8266c4f751aba9c504233
+  ewok_repository: ewok-core/ewok-core-1.0
+  ewok_revision: 34d912a608066c92e2990a0328ffc3bd9a716042
+  global_piqa_parallel_revision: b0b18516a8bc2cb1106bce3dd4db32848ca715ea
+  global_piqa_nonparallel_revision: 6777742fa3634c0583cda3b7f8a482ea7b1b0937
+
+models:
+  multispace:
+    path: logs/multispace_fineweb/fineweb-edu-s1024-multispace-100m-v1/multispace-flash/seed-42/final_model
+    parameters: 99985152
+  real:
+    path: logs/real_fineweb/fineweb-edu-s1024-real-100m-v1/real-flash/seed-42/final_model
+    parameters: 99985152
+
+zero_shot:
+  backend: mlm
+  dtype: bfloat16
+  tasks:
+    - blimp
+    - blimp_supplement
+    - ewok
+    - entity_tracking
+    - comps
+    - global_piqa_parallel
+    - global_piqa_nonparallel
+    - reading
+
+finetune:
+  tasks: [boolq, multirc, rte, wsc, mrpc, qqp, mnli]
+  learning_rate: 3.0e-5
+  batch_size: 32
+  big_task_batch_size: 16
+  epochs: 10
+  wsc_epochs: 30
+  sequence_length: 512
+  seed: 42
+  checkpoint_backend: flash
+  runtime_backend: torch
+  runtime_backend_reason: >-
+    The official classifier uses padded FP32 batches. The equivalent PyTorch
+    attention implementation supports these masks; learned tensors are unchanged.
+  labels:
+    mnli: {0: entailment, 1: neutral, 2: contradiction}
+    qqp: {0: not_duplicate, 1: duplicate}

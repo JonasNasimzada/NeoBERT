@@ -1,8 +1,10 @@
 import json
+import hashlib
 import math
 import os
 import shutil
 import re
+import tempfile
 import time
 from pathlib import Path
 from tqdm import tqdm
@@ -68,6 +70,15 @@ def count_batch_tokens(batch: BatchEncoding) -> int:
     return batch["input_ids"].numel()
 
 
+def count_trainable_real_scalars(parameters) -> int:
+    """Count trainable real scalar degrees of freedom."""
+    return sum(
+        parameter.numel() * (2 if parameter.is_complex() else 1)
+        for parameter in parameters
+        if parameter.requires_grad
+    )
+
+
 def advance_gradient_accumulation(
     metrics: Metrics,
     gradient_accumulation_steps: int,
@@ -106,7 +117,12 @@ def split_train_validation_dataset(dataset):
     return dataset["train"], dataset.get("validation")
 
 
-def validate_flat_packed_dataset_dict(dataset, cfg):
+def validate_flat_packed_dataset_dict(
+    dataset,
+    cfg,
+    tokenizer=None,
+    world_size=1,
+):
     """Validate the mask-free fixed-row DatasetDict used by the ablation."""
     if not cfg.dataset.get("cross_document_attention", False):
         return
@@ -153,6 +169,26 @@ def validate_flat_packed_dataset_dict(dataset, cfg):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("sequence_length") != sequence_length:
         raise ValueError("dataset manifest sequence length does not match the run")
+    configured_source = cfg.dataset.get("train")
+    if configured_source is not None:
+        expected_source = OmegaConf.to_container(
+            configured_source,
+            resolve=True,
+        )
+        if manifest.get("source") != expected_source:
+            raise ValueError(
+                "dataset manifest source does not match the configured source"
+            )
+    configured_token_limit = cfg.dataset.get("approx_token_limit")
+    expected_token_limit = (
+        int(configured_token_limit)
+        if configured_token_limit is not None
+        else None
+    )
+    if manifest.get("source_token_limit") != expected_token_limit:
+        raise ValueError(
+            "dataset manifest source token limit does not match the configuration"
+        )
     expected_source_rows = cfg.dataset.get("expected_source_rows")
     if expected_source_rows is not None:
         expected_source_rows = int(expected_source_rows)
@@ -195,6 +231,63 @@ def validate_flat_packed_dataset_dict(dataset, cfg):
             raise ValueError(
                 f"dataset manifest {split_name} columns must contain only input_ids"
             )
+
+    minimum_packed_rows = cfg.dataset.get("minimum_packed_rows")
+    if minimum_packed_rows is not None and len(dataset["train"]) < int(
+        minimum_packed_rows
+    ):
+        raise ValueError(
+            f"prepared dataset has {len(dataset['train']):,} training rows, "
+            f"below the configured minimum of {int(minimum_packed_rows):,}"
+        )
+
+    configured_schedule = cfg.dataset.get("training_schedule")
+    if configured_schedule is not None:
+        expected_schedule = OmegaConf.to_container(
+            configured_schedule,
+            resolve=True,
+        )
+        if manifest.get("training_schedule") != expected_schedule:
+            raise ValueError(
+                "dataset manifest training schedule does not match the configuration"
+            )
+        actual_global_sequences = (
+            int(cfg.dataloader.train.batch_size)
+            * int(cfg.trainer.gradient_accumulation_steps)
+            * int(world_size)
+        )
+        actual_schedule = {
+            "optimizer_steps": int(cfg.trainer.max_steps),
+            "global_sequences": actual_global_sequences,
+            "required_token_positions": (
+                int(cfg.trainer.max_steps)
+                * actual_global_sequences
+                * sequence_length
+            ),
+        }
+        if expected_schedule != actual_schedule:
+            raise ValueError(
+                "configured dataset training schedule does not match the active run: "
+                f"expected {expected_schedule}, got {actual_schedule}"
+            )
+
+    if tokenizer is not None:
+        tokenizer_manifest = manifest.get("tokenizer", {})
+        expected_tokenizer = {
+            "name": cfg.tokenizer.pretrained_model_name_or_path,
+            "revision": cfg.tokenizer.get("revision"),
+            "vocab_size": len(tokenizer),
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id,
+            "mask_token_id": tokenizer.mask_token_id,
+        }
+        for name, expected_value in expected_tokenizer.items():
+            if tokenizer_manifest.get(name) != expected_value:
+                raise ValueError(
+                    f"dataset tokenizer {name}={tokenizer_manifest.get(name)!r} "
+                    f"does not match the training tokenizer value {expected_value!r}"
+                )
 
 
 def validation_dataloader_kwargs(cfg):
@@ -358,12 +451,44 @@ def performance_metrics(
     return output
 
 
-def max_time_reached(accelerator, run_started_at, max_time_seconds):
-    if max_time_seconds is None:
+def max_time_reached(
+    accelerator,
+    run_started_at,
+    max_time_seconds,
+    *,
+    deadline_unix_seconds=None,
+    required_runway_seconds=0.0,
+):
+    """Return whether any rank lacks time for another safe unit of work.
+
+    ``max_time_seconds`` is a per-trainer fallback.  Slurm launchers additionally
+    pass an absolute deadline that starts before their preflight, so setup time
+    cannot consume the checkpoint reserve unnoticed.  At an optimizer boundary,
+    ``required_runway_seconds`` is the duration of the preceding accumulation
+    cycle; this prevents starting another cycle that is unlikely to finish before
+    the coordinated-stop deadline.
+    """
+    if max_time_seconds is None and deadline_unix_seconds is None:
         return False
-    local_reached = float(time.monotonic() - run_started_at >= max_time_seconds)
+    required_runway_seconds = float(required_runway_seconds)
+    if (
+        not math.isfinite(required_runway_seconds)
+        or required_runway_seconds < 0
+    ):
+        raise ValueError("required_runway_seconds must be finite and non-negative")
+
+    local_reached = False
+    if max_time_seconds is not None:
+        local_reached = (
+            time.monotonic() - run_started_at + required_runway_seconds
+            >= max_time_seconds
+        )
+    if deadline_unix_seconds is not None:
+        local_reached = local_reached or (
+            time.time() + required_runway_seconds >= deadline_unix_seconds
+        )
     reached = torch.tensor(
-        local_reached,
+        float(local_reached),
         dtype=torch.float32,
         device=accelerator.device,
     )
@@ -371,6 +496,24 @@ def max_time_reached(accelerator, run_started_at, max_time_seconds):
     # reduction API (which supports sum/mean, but not a cross-backend max).
     reached = accelerator.reduce(reached, reduction="sum")
     return bool(reached.detach().cpu().item())
+
+
+def optimizer_cycle_runway_seconds(minimum_seconds, observed_seconds):
+    """Return a validated lower-bounded estimate for one optimizer cycle."""
+    values = {
+        "minimum_optimizer_cycle_runway_seconds": float(minimum_seconds),
+        "train/last_optimizer_cycle_seconds": float(observed_seconds),
+    }
+    for name, value in values.items():
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    return max(values.values())
+
+
+def advance_epoch_if_exhausted(metrics, dataloader_exhausted):
+    """Advance the epoch counter only after natural dataloader exhaustion."""
+    if dataloader_exhausted:
+        metrics["train/epochs"] += 1
 
 
 def update_model_norm_metrics(metrics, accelerator, model):
@@ -533,8 +676,74 @@ def validate_prepacked_dataset(dataset, tokenizer, cfg, world_size):
         raise ValueError("dataset manifest sequence length does not match the run")
     if manifest.get("packed_token_positions") != expected_positions:
         raise ValueError("dataset manifest token count does not match the Arrow dataset")
-    if not manifest.get("packing", {}).get("padding_free", False):
+    packing = manifest.get("packing", {})
+    if not packing.get("padding_free", False):
         raise ValueError("dataset manifest does not declare padding-free packing")
+    if packing.get("cross_document_attention") is not False:
+        raise ValueError(
+            "dataset manifest must declare cross_document_attention=false"
+        )
+    if packing.get("document_ids") is not True:
+        raise ValueError("dataset manifest must declare document_ids=true")
+
+    configured_source = cfg.dataset.get("train")
+    if configured_source is not None:
+        expected_source = OmegaConf.to_container(
+            configured_source,
+            resolve=True,
+        )
+        if manifest.get("source") != expected_source:
+            raise ValueError(
+                "dataset manifest source does not match the configured source"
+            )
+    configured_token_limit = cfg.dataset.get("approx_token_limit")
+    expected_token_limit = (
+        int(configured_token_limit)
+        if configured_token_limit is not None
+        else None
+    )
+    if manifest.get("source_token_limit") != expected_token_limit:
+        raise ValueError(
+            "dataset manifest source token limit does not match the configuration"
+        )
+    expected_source_rows = cfg.dataset.get("expected_source_rows")
+    if expected_source_rows is not None and manifest.get("source_rows") != int(
+        expected_source_rows
+    ):
+        raise ValueError(
+            "dataset manifest source row count does not match the pinned full corpus"
+        )
+
+    configured_schedule = cfg.dataset.get("training_schedule")
+    if configured_schedule is not None:
+        expected_schedule = OmegaConf.to_container(
+            configured_schedule,
+            resolve=True,
+        )
+        if manifest.get("training_schedule") != expected_schedule:
+            raise ValueError(
+                "dataset manifest training schedule does not match the configuration"
+            )
+        actual_global_sequences = (
+            int(cfg.dataloader.train.batch_size)
+            * int(cfg.trainer.gradient_accumulation_steps)
+            * int(world_size)
+        )
+        actual_schedule = {
+            "optimizer_steps": int(cfg.trainer.max_steps),
+            "global_sequences": actual_global_sequences,
+            "required_token_positions": (
+                int(cfg.trainer.max_steps)
+                * actual_global_sequences
+                * sequence_length
+            ),
+        }
+        if expected_schedule != actual_schedule:
+            raise ValueError(
+                "configured dataset training schedule does not match the active run: "
+                f"expected {expected_schedule}, got {actual_schedule}"
+            )
+
     tokenizer_manifest = manifest.get("tokenizer", {})
     expected_tokenizer_values = {
         "vocab_size": len(tokenizer),
@@ -566,6 +775,355 @@ def _model_without_compile_wrapper(accelerator, model):
     while hasattr(model, "_orig_mod"):
         model = model._orig_mod
     return model
+
+
+RESUME_SIGNATURE_FILENAME = "resume_signature.json"
+RESUME_SIGNATURE_FORMAT_VERSION = 1
+
+
+def _canonical_json_value(value):
+    """Return a JSON-only, deterministically ordered copy of a config value."""
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("resume signature values must be finite JSON data") from error
+    return json.loads(encoded)
+
+
+def _sha256_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def _positive_environment_integer(environment, *names):
+    for name in names:
+        value = environment.get(name)
+        if value is None or value == "":
+            continue
+        try:
+            result = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} must be a positive integer") from error
+        if result <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return result
+    return None
+
+
+def resolve_resume_topology(world_size, environment=None):
+    """Resolve a rank-invariant machine/process topology for resume checks."""
+    world_size = int(world_size)
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    environment = os.environ if environment is None else environment
+    num_machines = _positive_environment_integer(
+        environment,
+        "NUM_MACHINES",
+        "SLURM_JOB_NUM_NODES",
+        "SLURM_NNODES",
+    )
+    processes_per_machine = _positive_environment_integer(
+        environment,
+        "LOCAL_WORLD_SIZE",
+        "GPUS_PER_NODE",
+    )
+
+    if num_machines is None and processes_per_machine is None:
+        num_machines, processes_per_machine = 1, world_size
+    elif num_machines is None:
+        if world_size % processes_per_machine != 0:
+            raise ValueError(
+                "world_size must be divisible by the local process count"
+            )
+        num_machines = world_size // processes_per_machine
+    elif processes_per_machine is None:
+        if world_size % num_machines != 0:
+            raise ValueError("world_size must be divisible by the machine count")
+        processes_per_machine = world_size // num_machines
+
+    if num_machines * processes_per_machine != world_size:
+        raise ValueError(
+            "resume topology is inconsistent: "
+            f"{num_machines} machines x {processes_per_machine} processes "
+            f"!= world_size {world_size}"
+        )
+    return {
+        "world_size": world_size,
+        "num_machines": num_machines,
+        "processes_per_machine": processes_per_machine,
+    }
+
+
+def _tokenizer_backend_sha256(tokenizer):
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        backend = getattr(tokenizer, "_tokenizer", None)
+    if backend is not None and callable(getattr(backend, "to_str", None)):
+        serialized = backend.to_str().encode("utf-8")
+    elif callable(getattr(tokenizer, "get_vocab", None)):
+        serialized = json.dumps(
+            tokenizer.get_vocab(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    else:
+        raise ValueError(
+            "prepacked resume signatures require a serializable tokenizer vocabulary"
+        )
+    return _sha256_bytes(serialized)
+
+
+def build_prepacked_resume_signature(
+    cfg,
+    train_dataset,
+    tokenizer,
+    *,
+    world_size,
+    topology=None,
+):
+    """Build the immutable identity required to resume a prepacked run."""
+    manifest_path = Path(cfg.dataset.path_to_disk) / "optibertneo_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"prepacked resume signature requires dataset manifest: {manifest_path}"
+        )
+    manifest_bytes = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"dataset manifest is invalid: {manifest_path}") from error
+    if not isinstance(manifest, dict):
+        raise RuntimeError("dataset manifest must contain a JSON object")
+
+    dataset_fingerprint = getattr(train_dataset, "_fingerprint", None)
+    if not isinstance(dataset_fingerprint, str) or not dataset_fingerprint:
+        raise RuntimeError("prepacked training dataset has no persistent fingerprint")
+    manifest_fingerprint = manifest.get("dataset_fingerprint")
+    if manifest_fingerprint != dataset_fingerprint:
+        raise RuntimeError(
+            "dataset manifest fingerprint does not match the loaded training dataset"
+        )
+
+    tokenizer_manifest = manifest.get("tokenizer")
+    if not isinstance(tokenizer_manifest, dict):
+        raise RuntimeError("dataset manifest has no tokenizer identity")
+    tokenizer_config = {
+        name: cfg.tokenizer.get(name)
+        for name in (
+            "max_length",
+            "vocab_size",
+            "truncation",
+            "chunk_long_documents",
+            "trust_remote_code",
+        )
+    }
+    special_token_ids = {
+        name: getattr(tokenizer, name, None)
+        for name in (
+            "bos_token_id",
+            "eos_token_id",
+            "pad_token_id",
+            "mask_token_id",
+            "unk_token_id",
+            "sep_token_id",
+            "cls_token_id",
+        )
+    }
+    topology = (
+        resolve_resume_topology(world_size)
+        if topology is None
+        else _canonical_json_value(topology)
+    )
+    expected_topology_keys = {
+        "world_size",
+        "num_machines",
+        "processes_per_machine",
+    }
+    if set(topology) != expected_topology_keys:
+        raise ValueError(
+            "topology must contain world_size, num_machines, and "
+            "processes_per_machine"
+        )
+    topology = {name: int(value) for name, value in topology.items()}
+    if min(topology.values()) <= 0:
+        raise ValueError("topology values must be positive")
+    if topology["world_size"] != int(world_size):
+        raise ValueError("topology world_size does not match the active world size")
+    if (
+        topology["num_machines"] * topology["processes_per_machine"]
+        != topology["world_size"]
+    ):
+        raise ValueError("topology machine/process product does not match world_size")
+
+    return _canonical_json_value(
+        {
+            "format_version": RESUME_SIGNATURE_FORMAT_VERSION,
+            "contract": "neobert-prepacked-training",
+            "topology": topology,
+            "batching": {
+                "per_device_microbatch": int(cfg.dataloader.train.batch_size),
+                "gradient_accumulation_steps": int(
+                    cfg.trainer.gradient_accumulation_steps
+                ),
+            },
+            "dataset": {
+                "fingerprint": dataset_fingerprint,
+                "rows": len(train_dataset),
+                "columns": list(train_dataset.column_names),
+                "manifest_sha256": _sha256_bytes(manifest_bytes),
+                "manifest_format_version": manifest.get("format_version"),
+                "manifest_fingerprint": manifest_fingerprint,
+            },
+            "seed": int(cfg.seed),
+            "model": _canonical_json_value(cfg.model),
+            "data_pipeline": {
+                "datacollator": _canonical_json_value(
+                    cfg.get("datacollator", {})
+                ),
+                "dataloader": {
+                    name: cfg.dataloader.train.get(name)
+                    for name in (
+                        "shuffle",
+                        "pack_sequences",
+                        "prepacked_sequences",
+                    )
+                },
+            },
+            "tokenizer": {
+                "source": {
+                    "name": tokenizer_manifest.get("name"),
+                    "revision": tokenizer_manifest.get("revision"),
+                },
+                "config": tokenizer_config,
+                "runtime": {
+                    "class": (
+                        f"{tokenizer.__class__.__module__}."
+                        f"{tokenizer.__class__.__qualname__}"
+                    ),
+                    "length": len(tokenizer),
+                    "model_max_length": int(tokenizer.model_max_length),
+                    "special_token_ids": special_token_ids,
+                    "backend_sha256": _tokenizer_backend_sha256(tokenizer),
+                },
+            },
+            "optimizer": _canonical_json_value(cfg.optimizer),
+            "scheduler": _canonical_json_value(cfg.scheduler),
+            "trainer_semantics": {
+                name: cfg.trainer.get(name)
+                for name in (
+                    "max_steps",
+                    "mixed_precision",
+                    "tf32",
+                    "gradient_clipping",
+                    "compile",
+                    "compile_fullgraph",
+                    "find_unused_parameters",
+                )
+            },
+        }
+    )
+
+
+def _signature_differences(saved, active, path=""):
+    if isinstance(saved, dict) and isinstance(active, dict):
+        differences = []
+        for key in sorted(set(saved) | set(active)):
+            child_path = f"{path}.{key}" if path else key
+            if key not in saved:
+                differences.append(f"{child_path}: missing from saved signature")
+            elif key not in active:
+                differences.append(f"{child_path}: absent from active signature")
+            else:
+                differences.extend(
+                    _signature_differences(saved[key], active[key], child_path)
+                )
+        return differences
+    if saved != active:
+        return [f"{path}: saved={saved!r}, active={active!r}"]
+    return []
+
+
+def _read_resume_signature(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"resume signature is unreadable or invalid: {path}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"resume signature must contain a JSON object: {path}")
+    return _canonical_json_value(value)
+
+
+def establish_prepacked_resume_signature(
+    run_directory,
+    active_signature,
+    *,
+    checkpoint_exists,
+):
+    """Atomically establish or strictly validate one persistent run identity."""
+    run_directory = Path(run_directory)
+    signature_path = run_directory / RESUME_SIGNATURE_FILENAME
+    active_signature = _canonical_json_value(active_signature)
+
+    if signature_path.exists():
+        saved_signature = _read_resume_signature(signature_path)
+        differences = _signature_differences(saved_signature, active_signature)
+        if differences:
+            details = "; ".join(differences[:8])
+            if len(differences) > 8:
+                details += f"; and {len(differences) - 8} more"
+            raise RuntimeError(f"prepacked resume signature mismatch: {details}")
+        return signature_path
+
+    if checkpoint_exists:
+        raise RuntimeError(
+            f"checkpoint state exists but resume signature is missing: {signature_path}"
+        )
+
+    run_directory.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{RESUME_SIGNATURE_FILENAME}.",
+        suffix=".tmp",
+        dir=run_directory,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                active_signature,
+                handle,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # Publishing a fully written inode with link(2) gives create-if-absent
+            # semantics. Concurrent ranks may race, but no rank can overwrite a
+            # different identity that was already established.
+            os.link(temporary_path, signature_path)
+        except FileExistsError:
+            pass
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    saved_signature = _read_resume_signature(signature_path)
+    differences = _signature_differences(saved_signature, active_signature)
+    if differences:
+        details = "; ".join(differences[:8])
+        raise RuntimeError(f"prepacked resume signature mismatch: {details}")
+    return signature_path
 
 
 def discover_resume_checkpoint(checkpoint_directory):
@@ -697,6 +1255,24 @@ def trainer(cfg: DictConfig):
         max_time_seconds = float(max_time_seconds)
         if not math.isfinite(max_time_seconds) or max_time_seconds <= 0:
             raise ValueError("trainer.max_time_seconds must be a positive finite number")
+    deadline_unix_seconds = cfg.trainer.get("deadline_unix_seconds")
+    if deadline_unix_seconds is not None:
+        deadline_unix_seconds = float(deadline_unix_seconds)
+        if (
+            not math.isfinite(deadline_unix_seconds)
+            or deadline_unix_seconds <= 0
+        ):
+            raise ValueError(
+                "trainer.deadline_unix_seconds must be a positive finite number"
+            )
+    minimum_optimizer_cycle_runway_seconds = float(
+        cfg.trainer.get("minimum_optimizer_cycle_runway_seconds", 0.0)
+    )
+    # Validate the configured floor before allocating or loading model state.
+    optimizer_cycle_runway_seconds(
+        minimum_optimizer_cycle_runway_seconds,
+        0.0,
+    )
 
     # Get the last complete checkpoint and choose an unused save index. An
     # interrupted checkpoint remains on disk for diagnosis but is never loaded.
@@ -737,14 +1313,6 @@ def trainer(cfg: DictConfig):
         kwargs_handlers=[kwargs],
     )
 
-    # Initialise the wandb run and pass wandb parameters
-    if cfg.wandb.get("dir") is not None:
-        os.makedirs(cfg.wandb.dir, exist_ok=True)
-    accelerator.init_trackers(
-        project_name=cfg.wandb.project,
-        init_kwargs={"wandb": wandb_init_kwargs(cfg, accelerator)},
-    )
-
     # Set the seed
     set_seed(cfg.seed)
 
@@ -768,17 +1336,44 @@ def trainer(cfg: DictConfig):
 
     # Dataset
     loaded_dataset = load_from_disk(cfg.dataset.path_to_disk)
-    validate_flat_packed_dataset_dict(loaded_dataset, cfg)
+    validate_flat_packed_dataset_dict(
+        loaded_dataset,
+        cfg,
+        tokenizer=tokenizer,
+        world_size=accelerator.num_processes,
+    )
     train_dataset, validation_dataset = split_train_validation_dataset(
         loaded_dataset
     )
-    if cfg.dataloader.train.get("prepacked_sequences", False):
+    prepacked_sequences = bool(
+        cfg.dataloader.train.get("prepacked_sequences", False)
+    )
+    if prepacked_sequences:
         validate_prepacked_dataset(
             train_dataset,
             tokenizer,
             cfg,
             accelerator.num_processes,
         )
+        active_resume_signature = build_prepacked_resume_signature(
+            cfg,
+            train_dataset,
+            tokenizer,
+            world_size=accelerator.num_processes,
+        )
+        establish_prepacked_resume_signature(
+            cfg.trainer.dir,
+            active_resume_signature,
+            checkpoint_exists=iteration > 0,
+        )
+
+    # Establish/validate the resume identity before creating an external run.
+    if cfg.wandb.get("dir") is not None:
+        os.makedirs(cfg.wandb.dir, exist_ok=True)
+    accelerator.init_trackers(
+        project_name=cfg.wandb.project,
+        init_kwargs={"wandb": wandb_init_kwargs(cfg, accelerator)},
+    )
 
     # Dataloaders. Validation deliberately collates in the training process so
     # evaluate_mlm can restore an identical MLM RNG stream on every invocation.
@@ -820,13 +1415,13 @@ def trainer(cfg: DictConfig):
     if resume_checkpoint is None:
         accelerator.log(
             {
-                "model/parameters": sum(
-                    p.numel() for p in model.parameters() if p.requires_grad
+                "model/parameters": count_trainable_real_scalars(
+                    model.parameters()
                 ),
-                "model/non_embedding_parameters": sum(
-                    p.numel()
-                    for p in model.parameters()
-                    if p.requires_grad and p is not embedding
+                "model/non_embedding_parameters": count_trainable_real_scalars(
+                    parameter
+                    for parameter in model.parameters()
+                    if parameter is not embedding
                 ),
             },
             step=0,
@@ -888,8 +1483,9 @@ def trainer(cfg: DictConfig):
     last_eval_step = None
     stopped_for_max_time = False
     final_status_logged = False
-    # A resumed run starts a new wall-clock guard window. Historical partial
-    # stops remain in W&B history, while the final export describes this run.
+    # A resumed allocation receives a new relative/absolute guard window.
+    # Historical partial stops remain in W&B history, while the final export
+    # describes this run.
     metrics["train/completed_schedule"] = int(
         metrics["train/steps"] == cfg.trainer.max_steps
     )
@@ -897,12 +1493,45 @@ def trainer(cfg: DictConfig):
     if accelerator.device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(accelerator.device)
 
+    last_optimizer_cycle_seconds = float(
+        metrics.get("train/last_optimizer_cycle_seconds", 0.0)
+    )
+    optimizer_cycle_runway = optimizer_cycle_runway_seconds(
+        minimum_optimizer_cycle_runway_seconds,
+        last_optimizer_cycle_seconds,
+    )
+    optimizer_cycle_started_at = None
     while cfg.trainer.max_steps > metrics["train/steps"]:
+        processed_batches = int(
+            metrics.get(
+                "train/processed_batches",
+                int(metrics["train/steps"])
+                * int(cfg.trainer.gradient_accumulation_steps),
+            )
+        )
+        at_optimizer_boundary = (
+            processed_batches % int(cfg.trainer.gradient_accumulation_steps) == 0
+        )
+        if at_optimizer_boundary and max_time_reached(
+            accelerator,
+            run_started_at,
+            max_time_seconds,
+            deadline_unix_seconds=deadline_unix_seconds,
+            required_runway_seconds=optimizer_cycle_runway,
+        ):
+            stopped_for_max_time = True
+            metrics["train/completed_schedule"] = 0
+            metrics["train/stopped_for_max_time"] = 1
+            break
+        if optimizer_cycle_started_at is None:
+            optimizer_cycle_started_at = time.monotonic()
+
         # Use skipped_train_dataloader the first epoch after resuming
         dataloader = train_dataloader if skipped_train_dataloader is None else skipped_train_dataloader
 
         stored_batch = {}
         i = 0
+        dataloader_exhausted = False
         for batch in dataloader:
             # Update number of batches
             metrics["train/batches"] += 1
@@ -971,6 +1600,17 @@ def trainer(cfg: DictConfig):
                 # Update the parameters and the scheduler
                 optimizer.step()
                 scheduler.step()
+                last_optimizer_cycle_seconds = max(
+                    time.monotonic() - optimizer_cycle_started_at,
+                    0.0,
+                )
+                metrics["train/last_optimizer_cycle_seconds"] = (
+                    last_optimizer_cycle_seconds
+                )
+                optimizer_cycle_runway = optimizer_cycle_runway_seconds(
+                    minimum_optimizer_cycle_runway_seconds,
+                    last_optimizer_cycle_seconds,
+                )
 
                 reached_step_limit = (
                     metrics["train/steps"] >= cfg.trainer.max_steps
@@ -979,6 +1619,8 @@ def trainer(cfg: DictConfig):
                     accelerator,
                     run_started_at,
                     max_time_seconds,
+                    deadline_unix_seconds=deadline_unix_seconds,
+                    required_runway_seconds=optimizer_cycle_runway,
                 )
                 stopped_for_max_time = (
                     stopped_for_max_time or reached_time_limit
@@ -1070,14 +1712,33 @@ def trainer(cfg: DictConfig):
                         metrics["train/steps"],
                     )
 
+                # Logging and periodic checkpointing can themselves consume a
+                # meaningful part of the remaining allocation.  Recheck at the
+                # optimizer boundary before any next accumulation cycle starts.
+                if not should_stop and max_time_reached(
+                    accelerator,
+                    run_started_at,
+                    max_time_seconds,
+                    deadline_unix_seconds=deadline_unix_seconds,
+                    required_runway_seconds=optimizer_cycle_runway,
+                ):
+                    reached_time_limit = True
+                    stopped_for_max_time = True
+                    should_stop = True
+                    metrics["train/completed_schedule"] = 0
+                    metrics["train/stopped_for_max_time"] = 1
+
                 if should_stop:
                     break
 
                 # Reset the gradient
                 optimizer.zero_grad()
+                optimizer_cycle_started_at = time.monotonic()
 
-        # Log metrics
-        metrics["train/epochs"] += 1
+        else:
+            dataloader_exhausted = True
+
+        advance_epoch_if_exhausted(metrics, dataloader_exhausted)
 
         # "Remove" the skipped dataloader once exhausted
         skipped_train_dataloader = None
@@ -1143,7 +1804,10 @@ def trainer(cfg: DictConfig):
                 metrics["train/steps"],
             )
 
-    if cfg.trainer.model.get("export_at_end", False):
+    if (
+        cfg.trainer.model.get("export_at_end", False)
+        and metrics["train/steps"] == cfg.trainer.max_steps
+    ):
         export_pretrained_model(
             accelerator,
             model,

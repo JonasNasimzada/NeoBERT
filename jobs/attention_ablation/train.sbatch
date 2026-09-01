@@ -30,7 +30,7 @@ setup_attention_runtime
 
 DATASET_PATH="$(realpath "${DATASET_PATH:?Set DATASET_PATH to the prepared BabyLM DatasetDict directory.}")"
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-1p376b-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-multispace-100m-v4}"
 SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-$ATTENTION_TARGET_STEPS}"
 MICRO_BATCH="${MICRO_BATCH:-4}"

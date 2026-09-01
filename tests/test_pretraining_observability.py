@@ -15,12 +15,15 @@ from omegaconf import OmegaConf
 
 from neobert.pretraining.metrics import Metrics
 from neobert.pretraining.trainer import (
+    advance_epoch_if_exhausted,
     advance_gradient_accumulation,
     build_training_summary,
     evaluate_mlm,
     max_time_reached,
+    optimizer_cycle_runway_seconds,
     split_train_validation_dataset,
     validate_flat_packed_dataset_dict,
+    validate_prepacked_dataset,
     validation_dataloader_kwargs,
     wandb_init_kwargs,
 )
@@ -114,6 +117,93 @@ class TestMetricsLogging(unittest.TestCase):
 
 
 class TestDatasetAndValidation(unittest.TestCase):
+    def test_document_isolated_manifest_pins_the_active_paper_schedule(self):
+        dataset = Dataset.from_dict(
+            {
+                "input_ids": [[1, 2, 3, 4]] * 4,
+                "document_ids": [[0, 0, 1, 1]] * 4,
+            }
+        )
+        source = {
+            "path": "HuggingFaceFW/fineweb-edu",
+            "name": "sample-10BT",
+            "split": "train",
+            "revision": "pinned-source-revision",
+        }
+        schedule = {
+            "optimizer_steps": 1,
+            "global_sequences": 2,
+            "required_token_positions": 8,
+        }
+
+        class TokenizerStub:
+            bos_token_id = 0
+            eos_token_id = 2
+            pad_token_id = 1
+            mask_token_id = 7
+
+            def __len__(self):
+                return 8
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory)
+            manifest = {
+                "rows": 4,
+                "sequence_length": 4,
+                "packed_token_positions": 16,
+                "source": source,
+                "source_token_limit": 16,
+                "packing": {
+                    "padding_free": True,
+                    "cross_document_attention": False,
+                    "document_ids": True,
+                },
+                "training_schedule": schedule,
+                "tokenizer": {
+                    "vocab_size": 8,
+                    "bos_token_id": 0,
+                    "eos_token_id": 2,
+                    "pad_token_id": 1,
+                    "mask_token_id": 7,
+                },
+            }
+            (path / "optibertneo_manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            cfg = OmegaConf.create(
+                {
+                    "dataset": {
+                        "path_to_disk": str(path),
+                        "train": source,
+                        "approx_token_limit": 16,
+                        "training_schedule": schedule,
+                    },
+                    "tokenizer": {"max_length": 4},
+                    "dataloader": {"train": {"batch_size": 1}},
+                    "trainer": {
+                        "max_steps": 1,
+                        "gradient_accumulation_steps": 1,
+                    },
+                }
+            )
+
+            validate_prepacked_dataset(
+                dataset,
+                TokenizerStub(),
+                cfg,
+                world_size=2,
+            )
+
+            cfg.trainer.max_steps = 2
+            with self.assertRaisesRegex(ValueError, "active run"):
+                validate_prepacked_dataset(
+                    dataset,
+                    TokenizerStub(),
+                    cfg,
+                    world_size=2,
+                )
+
     def test_datasetdict_uses_named_splits_and_dataset_remains_legacy_train(self):
         train = Dataset.from_dict({"input_ids": [[1, 2]]})
         validation = Dataset.from_dict({"input_ids": [[3, 4]]})
@@ -264,6 +354,117 @@ class TestDatasetAndValidation(unittest.TestCase):
                 cfg,
             )
 
+    def test_flat_packed_manifest_pins_fineweb_source_tokenizer_and_schedule(self):
+        dataset = DatasetDict(
+            {
+                "train": Dataset.from_dict(
+                    {"input_ids": [[1, 2, 3, 4], [5, 6, 7, 8]]}
+                ),
+                "validation": Dataset.from_dict(
+                    {"input_ids": [[9, 10, 11, 12]]}
+                ),
+            }
+        )
+        source = {
+            "path": "HuggingFaceFW/fineweb-edu",
+            "name": "sample-10BT",
+            "split": "train",
+            "revision": "pinned-source-revision",
+        }
+        schedule = {
+            "optimizer_steps": 1,
+            "global_sequences": 2,
+            "required_token_positions": 8,
+        }
+
+        class TokenizerStub:
+            bos_token_id = None
+            eos_token_id = None
+            pad_token_id = 0
+            mask_token_id = 103
+
+            def __len__(self):
+                return 30_522
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory)
+            manifest = {
+                "sequence_length": 4,
+                "source": source,
+                "source_token_limit": 8,
+                "packing": {
+                    "padding_free": True,
+                    "cross_document_attention": True,
+                    "document_ids": False,
+                },
+                "splits": {
+                    "train": {
+                        "rows": 2,
+                        "tokens": 8,
+                        "packed_token_positions": 8,
+                        "columns": ["input_ids"],
+                    },
+                    "validation": {
+                        "rows": 1,
+                        "tokens": 4,
+                        "packed_token_positions": 4,
+                        "columns": ["input_ids"],
+                    },
+                },
+                "training_schedule": schedule,
+                "tokenizer": {
+                    "name": "google-bert/bert-base-uncased",
+                    "revision": "pinned-tokenizer-revision",
+                    "vocab_size": 30_522,
+                    "bos_token_id": None,
+                    "eos_token_id": None,
+                    "pad_token_id": 0,
+                    "mask_token_id": 103,
+                },
+            }
+            (path / "optibertneo_manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+            cfg = OmegaConf.create(
+                {
+                    "dataset": {
+                        "path_to_disk": str(path),
+                        "pack_to_length": 4,
+                        "cross_document_attention": True,
+                        "approx_token_limit": 8,
+                        "minimum_packed_rows": 2,
+                        "training_schedule": schedule,
+                        "train": source,
+                    },
+                    "tokenizer": {
+                        "pretrained_model_name_or_path": (
+                            "google-bert/bert-base-uncased"
+                        ),
+                        "revision": "pinned-tokenizer-revision",
+                    },
+                    "dataloader": {"train": {"batch_size": 2}},
+                    "trainer": {
+                        "max_steps": 1,
+                        "gradient_accumulation_steps": 1,
+                    },
+                }
+            )
+
+            validate_flat_packed_dataset_dict(
+                dataset,
+                cfg,
+                tokenizer=TokenizerStub(),
+            )
+
+            cfg.trainer.max_steps = 2
+            with self.assertRaisesRegex(ValueError, "active run"):
+                validate_flat_packed_dataset_dict(
+                    dataset,
+                    cfg,
+                    tokenizer=TokenizerStub(),
+                )
+
     def test_validation_is_repeatable_and_restores_rng_and_training_mode(self):
         accelerator = AcceleratorStub()
         model = FixedLogitModel()
@@ -407,6 +608,45 @@ class TestRunMetadataAndTimeLimit(unittest.TestCase):
 
         self.assertTrue(reached)
         self.assertEqual(accelerator.reductions, ["sum"])
+
+    def test_absolute_deadline_reserves_one_observed_optimizer_cycle(self):
+        accelerator = AcceleratorStub()
+        with (
+            mock.patch(
+                "neobert.pretraining.trainer.time.monotonic",
+                return_value=5.0,
+            ),
+            mock.patch(
+                "neobert.pretraining.trainer.time.time",
+                return_value=100.0,
+            ),
+        ):
+            reached = max_time_reached(
+                accelerator,
+                run_started_at=0.0,
+                max_time_seconds=None,
+                deadline_unix_seconds=110.0,
+                required_runway_seconds=10.0,
+            )
+
+        self.assertTrue(reached)
+        self.assertEqual(accelerator.reductions, ["sum"])
+
+    def test_optimizer_cycle_runway_has_a_conservative_initial_floor(self):
+        self.assertEqual(optimizer_cycle_runway_seconds(1_200, 0), 1_200)
+        self.assertEqual(optimizer_cycle_runway_seconds(1_200, 1_500), 1_500)
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            optimizer_cycle_runway_seconds(1_200, float("nan"))
+
+    def test_mid_epoch_stop_does_not_advance_epoch_counter(self):
+        metrics = Metrics()
+        metrics["train/epochs"] = 3
+
+        advance_epoch_if_exhausted(metrics, dataloader_exhausted=False)
+        self.assertEqual(metrics["train/epochs"], 3)
+
+        advance_epoch_if_exhausted(metrics, dataloader_exhausted=True)
+        self.assertEqual(metrics["train/epochs"], 4)
 
     def test_training_summary_distinguishes_complete_and_guard_limited_runs(self):
         cfg = OmegaConf.create({"trainer": {"max_steps": 10}})

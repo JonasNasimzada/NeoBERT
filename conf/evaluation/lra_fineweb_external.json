@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "benchmark": "Long Range Arena",
+  "reporting_class": "external paired pretrained adaptation; not leaderboard-comparable",
+  "official_repository": {
+    "url": "https://github.com/google-research/long-range-arena",
+    "commit": "cd31e5c6b8e5bceabd28de2d2afb23f7ae5d36d8",
+    "license": "Apache-2.0"
+  },
+  "checkpoint_native_context": 1024,
+  "positional_encoding": "RoPE",
+  "tasks": {
+    "listops": {
+      "canonical_length": 2000,
+      "status": "unsupported",
+      "reason": "exceeds the checkpoints' native 1024-token context; no truncation or positional extrapolation"
+    },
+    "byte_text_imdb": {
+      "canonical_length": 4000,
+      "status": "unsupported",
+      "reason": "canonical paper protocol exceeds native context; the official repository's legacy 1000-byte default is not substituted for the canonical 4K task"
+    },
+    "retrieval_aan": {
+      "canonical_length_per_document": 4000,
+      "status": "unsupported",
+      "reason": "exceeds native context; official LRA also cannot redistribute the underlying AAN document text"
+    },
+    "image_cifar10": {
+      "pixel_length": 1024,
+      "internal_length_with_cls": 1025,
+      "status": "runnable_external_adaptation",
+      "adaptation": "regenerate the analytical nonpersistent RoPE buffer for one additional CLS position; no learned parameters are changed or added to the checkpoint backbone",
+      "pooling": "official CLS pooling",
+      "truncation": "none"
+    },
+    "pathfinder32": {
+      "canonical_length": 1024,
+      "status": "data_unavailable",
+      "reason": "fits native context, but the official release URL returns HTTP 403; an unverified community mirror with anomalous split shapes was rejected"
+    },
+    "path_x": {
+      "canonical_length": 16384,
+      "status": "unsupported",
+      "reason": "exceeds native context by 16x and the official data release is unavailable"
+    }
+  },
+  "aggregation": {
+    "seeds": [42, 43, 44],
+    "paired_variants": ["multispace-flash", "real-flash"],
+    "primary_metric": "CIFAR-10 test accuracy",
+    "report_mean_std": true,
+    "report_paired_delta_95pct_t_interval": true,
+    "suite_average": "not reported because only one of six canonical tasks is runnable"
+  }
+}

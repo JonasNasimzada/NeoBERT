@@ -1,0 +1,21 @@
+name: fineweb_edu
+column: text
+path_to_disk: tokenized_datasets/fineweb_edu_google_1024_1p6b
+approx_token_limit: 1600000000
+pack_to_length: 1024
+cross_document_attention: true
+validation_fraction: 0.01
+validation_seed: 0
+train_split: train
+validation_split: validation
+minimum_packed_rows: 1344000
+require_manifest: true
+training_schedule:
+  optimizer_steps: 84000
+  global_sequences: 16
+  required_token_positions: 1376256000
+train:
+  path: HuggingFaceFW/fineweb-edu
+  name: sample-10BT
+  split: train
+  revision: 87f09149ef4734204d70ed1d046ddc9ca3f2b8f9

@@ -3,15 +3,17 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-Usage: jobs/optibertneo-1p3b.sh {real|baseline}
+Usage: jobs/optibertneo-1p3b.sh {real|baseline|multispace}
 
-Launch this script once per node. For the paper's real-valued OptiBERTneo
-1.3B-token run, use "real" (the legacy alias "baseline" is identical).
+Launch this script once per node. Use "real" for the paper's real-valued
+OptiBERTneo run (the legacy alias "baseline" is identical), or "multispace"
+for the parameter-matched complex/split-complex/dual-number model.
 
 Important overrides:
   PYTHON_BIN, NUM_MACHINES, GPUS_PER_NODE, MACHINE_RANK
   MASTER_ADDR, MASTER_PORT, OPTIBERT_DATASET, RUN_ROOT
-  MICRO_BATCH, GLOBAL_SEQUENCES, DATALOADER_WORKERS
+  MICRO_BATCH, DATALOADER_WORKERS, MAX_TIME_SECONDS
+  OPTIBERT_TRAINING_DEADLINE_EPOCH (absolute coordinated-stop deadline)
   ACCELERATE_CONFIG, WANDB_MODE, WANDB_ENTITY, TORCH_COMPILE
   EXPECTED_WORLD_SIZE, EXPECTED_NUM_MACHINES, STAGE_DATASET
   SMOKE_TEST=1 (two optimizer steps), DRY_RUN=1 (print checks only)
@@ -34,6 +36,12 @@ case "$variant" in
         run_variant=real
         model_config=optibertneo-198m
         default_micro_batch=32
+        default_accelerate_config=accelerate_ddp.yaml
+        ;;
+    multispace)
+        run_variant=multispace
+        model_config=optibertneo-198m-multispace
+        default_micro_batch=8
         default_accelerate_config=accelerate_ddp.yaml
         ;;
     *)
@@ -75,10 +83,16 @@ if [[ -n "${EXPECTED_NUM_MACHINES:-}" ]] && ((num_machines != EXPECTED_NUM_MACHI
 fi
 
 denominator=$((world_size * micro_batch))
+schedule_override=()
 if [[ "${SMOKE_TEST:-0}" == 1 ]]; then
     global_sequences=$denominator
     training_steps=2
     warmup_steps=1
+    # A two-step kernel smoke intentionally does not claim the paper schedule.
+    schedule_override=("dataset.training_schedule=null")
+elif ((global_sequences != 2048)); then
+    echo "The 1.3B-token recipe fixes GLOBAL_SEQUENCES=2048; got $global_sequences" >&2
+    exit 2
 fi
 if ((global_sequences % denominator != 0)); then
     echo "GLOBAL_SEQUENCES=$global_sequences must be divisible by WORLD_SIZE*MICRO_BATCH=$denominator" >&2
@@ -132,15 +146,36 @@ wandb_mode=${WANDB_MODE:-offline}
 compile_model=${TORCH_COMPILE:-true}
 dataloader_workers=${DATALOADER_WORKERS:-8}
 require_positive_integer DATALOADER_WORKERS "$dataloader_workers"
+max_time_override=()
+deadline_override=()
+if [[ -n "${MAX_TIME_SECONDS:-}" ]]; then
+    require_positive_integer MAX_TIME_SECONDS "$MAX_TIME_SECONDS"
+    max_time_override=("trainer.max_time_seconds=$MAX_TIME_SECONDS")
+fi
+training_deadline_epoch=${OPTIBERT_TRAINING_DEADLINE_EPOCH:-}
+if [[ -z "$training_deadline_epoch" && -n "${MAX_TIME_SECONDS:-}" ]]; then
+    # Direct launcher use has no outer Slurm script from which to inherit an
+    # absolute deadline.  Production Slurm jobs export this before preflight.
+    launcher_started_epoch=$(date +%s)
+    training_deadline_epoch=$((launcher_started_epoch + MAX_TIME_SECONDS))
+fi
+if [[ -n "$training_deadline_epoch" ]]; then
+    require_positive_integer OPTIBERT_TRAINING_DEADLINE_EPOCH "$training_deadline_epoch"
+    deadline_override=("trainer.deadline_unix_seconds=$training_deadline_epoch")
+fi
 
 echo "variant=$run_variant model=$model_config"
 echo "topology=${num_machines}x${gpus_per_node} world_size=$world_size machine_rank=$machine_rank"
 echo "micro_batch=$micro_batch gradient_accumulation=$gradient_accumulation_steps"
 echo "global_batch=$global_sequences sequences ($((global_sequences * sequence_length)) token positions)"
-echo "steps=$training_steps scheduled_tokens=$((training_steps * global_sequences * sequence_length))"
+echo "sequence_length=$sequence_length steps=$training_steps warmup_steps=$warmup_steps"
+echo "scheduled_sequences=$((training_steps * global_sequences)) scheduled_tokens=$((training_steps * global_sequences * sequence_length))"
+echo "recipe=FineWeb-Edu/RoBERTa optimizer=optibertneo scheduler=optibertneo_1p3b trainer=optibertneo_1p3b datacollator=mlm_20"
 echo "dataset=$dataset_path"
 echo "run_root=$run_root"
 echo "launcher=$accelerate_config python=$python_bin"
+echo "max_time_seconds=${MAX_TIME_SECONDS:-unlimited}"
+echo "training_deadline_epoch=${training_deadline_epoch:-unlimited}"
 
 if [[ "${DRY_RUN:-0}" == 1 ]]; then
     exit 0
@@ -206,4 +241,7 @@ exec "$python_bin" -m accelerate.commands.launch \
     wandb.dir="$run_root/wandb" \
     hydra.run.dir="$run_root/hydra/\${oc.env:RANK,0}" \
     "${tokenizer_override[@]}" \
-    "${wandb_entity_override[@]}"
+    "${wandb_entity_override[@]}" \
+    "${max_time_override[@]}" \
+    "${deadline_override[@]}" \
+    "${schedule_override[@]}"

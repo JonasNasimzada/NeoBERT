@@ -27,7 +27,7 @@ wandb:
     - babylm-2026-strict
     - sequence-1024
     - padding-free-packing
-    - equal-parameters
+    - equal-token-budget
   dir: ${oc.env:WANDB_DIR,logs/wandb}
   mode: ${oc.env:WANDB_MODE,online}
   log_interval: 840

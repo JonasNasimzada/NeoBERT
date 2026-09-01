@@ -1,5 +1,8 @@
 # OptiBERTneo real-valued 1.3B-token H100 runbook
 
+> For the current parameter-matched real/multispace pair, use
+> `OPTIBERTNEO_MULTISPACE.md`. This page remains the legacy real-only runbook.
+
 This runbook trains the real-valued OptiBERTneo short-run variant from the
 [EMNLP 2025 paper](https://aclanthology.org/2025.emnlp-main.1804/) on two
 Slurm nodes with four H100 GPUs per node.
@@ -56,7 +59,8 @@ The paper does not release enough information for a bitwise reproduction of
 the checkpoint or exact data order. This checkout therefore pins and records
 the choices needed for an executable reconstruction:
 
-- FineWeb-Edu `sample-10BT` at revision `v1.0.0`; documents are selected in
+- FineWeb-Edu `sample-10BT` at immutable revision
+  `fc9850dff5e2d0f8f776efe41b24a1c49556cfc5`; documents are selected in
   source order until approximately 1.6B source tokens are available
 - `FacebookAI/roberta-base` at commit
   `e2da8e2f811d1448a5b465c236feacd80ffbac7b`

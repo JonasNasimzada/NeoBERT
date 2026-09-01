@@ -71,45 +71,64 @@ def flatten_numeric_values(
 
 def parse_key_value_report(text: str) -> dict[tuple[str, ...], float]:
     metrics: dict[tuple[str, ...], float] = {}
-    pending_section: tuple[str, ...] | None = None
+    current_section: tuple[str, ...] | None = None
+    seen_report_keys: set[tuple[str, ...]] = set()
     for line in text.splitlines():
         header_match = SECTION_HEADER_PATTERN.match(line)
         if header_match is not None:
-            pending_section = (_segment(header_match.group(1)),)
+            current_section = (_segment(header_match.group(1)),)
             continue
 
         match = KEY_VALUE_PATTERN.match(line)
         if match is not None:
             key, raw_value, percent = match.groups()
             value = float(raw_value)
-            if percent:
+            if percent or (
+                current_section is not None
+                and current_section[-1].endswith("accuracy")
+                and 1.0 < abs(value) <= 100.0
+            ):
                 value /= 100.0
             segments = tuple(
                 _segment(part)
                 for part in re.split(r"\s*/\s*", key)
                 if part.strip()
             ) or ("value",)
-            if segments in metrics:
+            if current_section is not None:
+                segments = (*current_section, *segments)
+            raw_identity = (*(current_section or ()), key.strip())
+            if raw_identity in seen_report_keys:
                 raise ValueError(f"duplicate report key: {key!r}")
+            seen_report_keys.add(raw_identity)
+            if segments in metrics:
+                # Official reports can contain distinct raw labels that only
+                # collide after W&B-safe normalization (EWoK currently emits
+                # both "variable swap" and "variable_swap"). Preserve every
+                # value with a deterministic ordinal suffix while continuing
+                # to reject a genuinely repeated raw key above.
+                base = segments[-1]
+                ordinal = 2
+                while (*segments[:-1], f"{base}_{ordinal}") in metrics:
+                    ordinal += 1
+                segments = (*segments[:-1], f"{base}_{ordinal}")
             metrics[segments] = value
-            pending_section = None
             continue
 
-        if pending_section is not None:
+        if current_section is not None:
             bare_match = BARE_NUMBER_PATTERN.match(line)
             if bare_match is not None:
                 raw_value, percent = bare_match.groups()
                 value = float(raw_value)
-                if percent:
+                if percent or (
+                    current_section[-1].endswith("accuracy")
+                    and 1.0 < abs(value) <= 100.0
+                ):
                     value /= 100.0
-                if pending_section in metrics:
+                if current_section in metrics:
                     raise ValueError(
-                        f"duplicate report section: {pending_section[0]!r}"
+                        f"duplicate report section: {current_section[0]!r}"
                     )
-                metrics[pending_section] = value
-                pending_section = None
-            elif line.strip():
-                pending_section = None
+                metrics[current_section] = value
     return metrics
 
 

@@ -3,6 +3,15 @@ mixed_precision: bf16
 resume: true
 disable_tqdm: false
 max_steps: 620
+# The Slurm launcher fills these at runtime.  Keeping both keys in the schema
+# makes Hydra overrides explicit and lets direct, non-Slurm runs use the
+# relative limit as a fallback.
+max_time_seconds: null
+deadline_unix_seconds: null
+# Before starting any accumulation cycle, require at least this much time until
+# the coordinated-stop deadline.  Later cycles use the larger of this floor and
+# the duration observed for the preceding cycle.
+minimum_optimizer_cycle_runway_seconds: 1200
 gradient_accumulation_steps: 1
 gradient_clipping: 1
 compile: true

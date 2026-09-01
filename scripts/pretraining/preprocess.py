@@ -21,8 +21,12 @@ from datasets import (
 from neobert.tokenizer import get_tokenizer, tokenize
 
 
-def select_approx_token_limit(dataset, token_limit):
+def select_approx_token_limit(dataset, token_limit, selection_metadata=None):
+    """Select a source prefix and optionally record its exact size."""
     if token_limit is None:
+        if selection_metadata is not None:
+            selection_metadata["selected_source_rows"] = len(dataset)
+            selection_metadata["selected_source_tokens"] = None
         return dataset
     if "token_count" not in dataset.column_names:
         raise ValueError("dataset.approx_token_limit requires a token_count column")
@@ -35,6 +39,9 @@ def select_approx_token_limit(dataset, token_limit):
             row_count += 1
             if total_tokens >= token_limit:
                 print(f"Selected {row_count:,} documents with about {total_tokens:,} source tokens")
+                if selection_metadata is not None:
+                    selection_metadata["selected_source_rows"] = row_count
+                    selection_metadata["selected_source_tokens"] = total_tokens
                 return dataset.select(range(row_count))
     raise ValueError(
         f"dataset contains only about {total_tokens:,} tokens, below the requested {token_limit:,}"
@@ -188,7 +195,15 @@ def _split_manifest(dataset, sequence_length):
     }
 
 
-def save_preprocessed_dataset(dataset, tokenizer, cfg, *, source_rows=None):
+def save_preprocessed_dataset(
+    dataset,
+    tokenizer,
+    cfg,
+    *,
+    source_rows=None,
+    selected_source_rows=None,
+    selected_source_tokens=None,
+):
     output_path = Path(cfg.dataset.path_to_disk).resolve()
     if output_path.exists():
         raise FileExistsError(
@@ -232,6 +247,19 @@ def save_preprocessed_dataset(dataset, tokenizer, cfg, *, source_rows=None):
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": OmegaConf.to_container(cfg.dataset.train, resolve=True),
         "source_rows": int(source_rows) if source_rows is not None else None,
+        "source_total_rows": (
+            int(source_rows) if source_rows is not None else None
+        ),
+        "selected_source_rows": (
+            int(selected_source_rows)
+            if selected_source_rows is not None
+            else None
+        ),
+        "selected_source_tokens": (
+            int(selected_source_tokens)
+            if selected_source_tokens is not None
+            else None
+        ),
         "source_token_limit": (
             int(configured_token_limit)
             if configured_token_limit is not None
@@ -268,7 +296,37 @@ def save_preprocessed_dataset(dataset, tokenizer, cfg, *, source_rows=None):
             "mask_token_id": tokenizer.mask_token_id,
         },
     }
-    if cfg.dataset.name == "fineweb_edu":
+    configured_training_schedule = cfg.dataset.get("training_schedule")
+    if configured_training_schedule is not None:
+        training_schedule = OmegaConf.to_container(
+            configured_training_schedule,
+            resolve=True,
+        )
+        if not isinstance(training_schedule, dict):
+            raise TypeError("dataset.training_schedule must be a mapping")
+        optimizer_steps = int(training_schedule["optimizer_steps"])
+        global_sequences = int(training_schedule["global_sequences"])
+        required_token_positions = int(
+            training_schedule["required_token_positions"]
+        )
+        expected_token_positions = (
+            optimizer_steps * global_sequences * int(sequence_length)
+        )
+        if min(optimizer_steps, global_sequences, required_token_positions) <= 0:
+            raise ValueError("dataset.training_schedule values must be positive")
+        if required_token_positions != expected_token_positions:
+            raise ValueError(
+                "dataset.training_schedule.required_token_positions must equal "
+                "optimizer_steps * global_sequences * pack_to_length"
+            )
+        manifest["training_schedule"] = {
+            "optimizer_steps": optimizer_steps,
+            "global_sequences": global_sequences,
+            "required_token_positions": required_token_positions,
+        }
+    elif cfg.dataset.name == "fineweb_edu":
+        # Preserve the legacy OptiBERTneo paper manifest when its older
+        # FineWeb-Edu/RoBERTa configuration is used.
         manifest["paper_schedule"] = {
             "optimizer_steps": 620,
             "global_sequences": 2048,
@@ -312,9 +370,11 @@ def preprocess(cfg: DictConfig):
         cfg.dataset.get("expected_source_rows"),
     )
     source_rows = len(dataset)
+    selection_metadata = {}
     dataset = select_approx_token_limit(
         dataset,
         cfg.dataset.get("approx_token_limit"),
+        selection_metadata,
     )
     dataset = create_train_validation_split(
         dataset,
@@ -383,6 +443,8 @@ def preprocess(cfg: DictConfig):
         tokenizer,
         cfg,
         source_rows=source_rows,
+        selected_source_rows=selection_metadata.get("selected_source_rows"),
+        selected_source_tokens=selection_metadata.get("selected_source_tokens"),
     )
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only preflight checks for the real-space OptiBERTneo run.
+"""Read-only preflight checks for the paired OptiBERTneo runs.
 
 The training launcher invokes this program independently on every node.  It
 does not initialize torch.distributed, contact the network, mutate the
@@ -41,8 +41,9 @@ DATASET_SOURCE = {
     "path": "HuggingFaceFW/fineweb-edu",
     "name": "sample-10BT",
     "split": "train",
-    "revision": "v1.0.0",
+    "revision": "fc9850dff5e2d0f8f776efe41b24a1c49556cfc5",
 }
+EXPECTED_SOURCE_ROWS = 9_672_101
 TOKENIZER_IDENTITY = {
     "name": "FacebookAI/roberta-base",
     "revision": "e2da8e2f811d1448a5b465c236feacd80ffbac7b",
@@ -178,7 +179,7 @@ class Recipe:
 
 @dataclass(frozen=True)
 class ModelCounts:
-    """Unique parameter counts for the tied real-space MLM."""
+    """Unique parameter counts for one tied-embedding MLM variant."""
 
     paper_target: int
     non_embedding: int
@@ -251,13 +252,37 @@ EXPECTED_CONFIG_VALUES: Mapping[str, Mapping[str, Any]] = {
         "hidden_act": "swiglu",
         "fused_swiglu": False,
         "dropout": 0,
+        "attention_dropout": 0,
         "norm_eps": 1e-5,
         "embedding_init_range": 0.02,
         "decoder_init_range": 0.02,
         "tie_word_embeddings": True,
         "lm_head_bias": False,
+        "ngpt": False,
         "attention_space": "real",
         "attention_backend": "flex",
+    },
+    "conf/model/optibertneo-198m-multispace.yaml": {
+        "hidden_size": 768,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 12,
+        "intermediate_size": 1_536,
+        "rope": True,
+        "rms_norm": True,
+        "embedding_rms_norm": True,
+        "hidden_act": "swiglu",
+        "fused_swiglu": False,
+        "dropout": 0,
+        "attention_dropout": 0,
+        "norm_eps": 1e-5,
+        "embedding_init_range": 0.02,
+        "decoder_init_range": 0.02,
+        "tie_word_embeddings": True,
+        "lm_head_bias": False,
+        "ngpt": False,
+        "attention_space": "multispace",
+        "attention_backend": "flex",
+        "multispace_cuda_streams": True,
     },
     "conf/tokenizer/roberta.yaml": {
         "pretrained_model_name_or_path": TOKENIZER_IDENTITY["name"],
@@ -271,9 +296,15 @@ EXPECTED_CONFIG_VALUES: Mapping[str, Mapping[str, Any]] = {
     "conf/dataset/fineweb_edu.yaml": {
         "path_to_disk": "tokenized_datasets/fineweb_edu_roberta_1p6b",
         "approx_token_limit": 1_600_000_000,
+        "expected_source_rows": EXPECTED_SOURCE_ROWS,
         "pack_to_length": SEQUENCE_LENGTH,
+        "cross_document_attention": False,
+        "validation_fraction": None,
         "minimum_packed_rows": MINIMUM_PACKED_ROWS,
         "require_manifest": True,
+        "training_schedule.optimizer_steps": TRAINING_STEPS,
+        "training_schedule.global_sequences": GLOBAL_SEQUENCES,
+        "training_schedule.required_token_positions": SCHEDULED_TOKENS,
         "train.path": DATASET_SOURCE["path"],
         "train.name": DATASET_SOURCE["name"],
         "train.split": DATASET_SOURCE["split"],
@@ -301,6 +332,9 @@ EXPECTED_CONFIG_VALUES: Mapping[str, Mapping[str, Any]] = {
         "mixed_precision": "bf16",
         "resume": True,
         "max_steps": TRAINING_STEPS,
+        "max_time_seconds": None,
+        "deadline_unix_seconds": None,
+        "minimum_optimizer_cycle_runway_seconds": 1_200,
         "gradient_clipping": 1,
         "compile": True,
         "find_unused_parameters": False,
@@ -476,6 +510,43 @@ def calculate_real_model_counts(
     )
 
 
+def calculate_multispace_model_counts(
+    *,
+    hidden_size: int = 768,
+    num_hidden_layers: int = 28,
+    intermediate_size: int = 1_536,
+    vocab_size: int = 50_265,
+    rms_norm: bool = True,
+    embedding_rms_norm: bool = True,
+    tie_word_embeddings: bool = True,
+    lm_head_bias: bool = False,
+) -> ModelCounts:
+    """Count the 4/4/4 multispace model's trainable real scalars."""
+
+    swiglu_width = math.ceil((2 * intermediate_size / 3) / 8) * 8
+    # H -> 6H packed two-component QKV plus one shared 2H -> H output.
+    attention_per_layer = 8 * hidden_size**2
+    swiglu_per_layer = 3 * hidden_size * swiglu_width
+    norm_per_layer = 2 * hidden_size if rms_norm else 4 * hidden_size
+    non_embedding = num_hidden_layers * (
+        attention_per_layer + swiglu_per_layer + norm_per_layer
+    )
+    if embedding_rms_norm:
+        non_embedding += hidden_size
+    non_embedding += hidden_size if rms_norm else 2 * hidden_size
+    if not tie_word_embeddings:
+        non_embedding += vocab_size * hidden_size
+    if lm_head_bias:
+        non_embedding += vocab_size
+
+    embedding = vocab_size * hidden_size
+    return ModelCounts(
+        paper_target=12 * 768**2 * 28,
+        non_embedding=non_embedding,
+        total=embedding + non_embedding,
+    )
+
+
 def _configuration_checks(project_root: Path) -> list[Check]:
     checks: list[Check] = []
     loaded: dict[str, dict[str, Any]] = {}
@@ -517,11 +588,25 @@ def _configuration_checks(project_root: Path) -> list[Check]:
                 )
             )
 
-    model_values = loaded.get("conf/model/optibertneo-198m.yaml")
     tokenizer_values = loaded.get("conf/tokenizer/roberta.yaml")
-    if model_values is not None and tokenizer_values is not None:
+    model_count_contracts = (
+        (
+            "real",
+            "conf/model/optibertneo-198m.yaml",
+            calculate_real_model_counts,
+        ),
+        (
+            "multispace",
+            "conf/model/optibertneo-198m-multispace.yaml",
+            calculate_multispace_model_counts,
+        ),
+    )
+    for variant, model_path, count_function in model_count_contracts:
+        model_values = loaded.get(model_path)
+        if model_values is None or tokenizer_values is None:
+            continue
         try:
-            counts = calculate_real_model_counts(
+            counts = count_function(
                 hidden_size=int(model_values["hidden_size"]),
                 num_hidden_layers=int(model_values["num_hidden_layers"]),
                 intermediate_size=int(model_values["intermediate_size"]),
@@ -532,7 +617,9 @@ def _configuration_checks(project_root: Path) -> list[Check]:
                 lm_head_bias=bool(model_values["lm_head_bias"]),
             )
         except (KeyError, TypeError, ValueError) as error:
-            checks.append(Check("model.parameter_count", FAIL, str(error)))
+            checks.append(
+                Check(f"model.{variant}.parameter_count", FAIL, str(error))
+            )
         else:
             if (
                 counts.non_embedding != EXPECTED_NON_EMBEDDING_PARAMETERS
@@ -540,7 +627,7 @@ def _configuration_checks(project_root: Path) -> list[Check]:
             ):
                 checks.append(
                     Check(
-                        "model.parameter_count",
+                        f"model.{variant}.parameter_count",
                         FAIL,
                         f"calculated non-embedding={counts.non_embedding:,}, "
                         f"total={counts.total:,}",
@@ -549,7 +636,7 @@ def _configuration_checks(project_root: Path) -> list[Check]:
             elif abs(counts.relative_paper_difference) > 0.001:
                 checks.append(
                     Check(
-                        "model.parameter_count",
+                        f"model.{variant}.parameter_count",
                         FAIL,
                         "non-embedding count differs from the paper target "
                         "by more than 0.1%",
@@ -558,33 +645,44 @@ def _configuration_checks(project_root: Path) -> list[Check]:
             else:
                 checks.append(
                     Check(
-                        "model.parameter_count",
+                        f"model.{variant}.parameter_count",
                         PASS,
-                        f"{counts.non_embedding:,} non-embedding and "
+                        f"{variant}: {counts.non_embedding:,} non-embedding and "
                         f"{counts.total:,} total unique parameters "
                         f"({counts.relative_paper_difference:+.4%} vs paper)",
                     )
                 )
 
     try:
-        recipe = Recipe()
+        recipes = {
+            "real": Recipe(micro_batch=32),
+            "multispace": Recipe(micro_batch=8),
+        }
     except ValueError as error:  # pragma: no cover - constants are immutable
         checks.append(Check("recipe.distributed_math", FAIL, str(error)))
     else:
+        real_recipe = recipes["real"]
+        multispace_recipe = recipes["multispace"]
         if (
-            recipe.world_size != 8
-            or recipe.gradient_accumulation_steps != 8
-            or recipe.scheduled_rows != MINIMUM_PACKED_ROWS
-            or recipe.scheduled_tokens != SCHEDULED_TOKENS
+            real_recipe.world_size != 8
+            or real_recipe.gradient_accumulation_steps != 8
+            or multispace_recipe.gradient_accumulation_steps != 32
+            or any(
+                recipe.scheduled_rows != MINIMUM_PACKED_ROWS
+                or recipe.scheduled_tokens != SCHEDULED_TOKENS
+                for recipe in recipes.values()
+            )
         ):
             checks.append(
                 Check(
                     "recipe.distributed_math",
                     FAIL,
-                    f"world={recipe.world_size}, accumulation="
-                    f"{recipe.gradient_accumulation_steps}, rows="
-                    f"{recipe.scheduled_rows:,}, tokens="
-                    f"{recipe.scheduled_tokens:,}",
+                    "real accumulation="
+                    f"{real_recipe.gradient_accumulation_steps}, multispace "
+                    "accumulation="
+                    f"{multispace_recipe.gradient_accumulation_steps}, rows="
+                    f"{real_recipe.scheduled_rows:,}, tokens="
+                    f"{real_recipe.scheduled_tokens:,}",
                 )
             )
         else:
@@ -592,8 +690,9 @@ def _configuration_checks(project_root: Path) -> list[Check]:
                 Check(
                     "recipe.distributed_math",
                     PASS,
-                    "2 nodes x 4 GPUs, microbatch 32, accumulation 8, "
-                    f"{recipe.scheduled_tokens:,} scheduled tokens",
+                    "2 nodes x 4 GPUs: real microbatch 32/accumulation 8; "
+                    "multispace microbatch 8/accumulation 32; "
+                    f"{real_recipe.scheduled_tokens:,} scheduled tokens each",
                 )
             )
 
@@ -605,6 +704,8 @@ def _configuration_checks(project_root: Path) -> list[Check]:
         launcher_patterns = {
             "baseline real model": r"model_config=optibertneo-198m",
             "baseline microbatch": r"default_micro_batch=32",
+            "multispace model": r"model_config=optibertneo-198m-multispace",
+            "multispace microbatch": r"default_micro_batch=8",
             "global batch": r"global_sequences=\$\{GLOBAL_SEQUENCES:-2048\}",
             "sequence length": r"sequence_length=1024",
             "optimizer steps": r"training_steps=620",
@@ -632,7 +733,7 @@ def _configuration_checks(project_root: Path) -> list[Check]:
                 Check(
                     "config.launcher",
                     PASS,
-                    "real model and distributed recipe are wired into launcher",
+                    "real and multispace distributed recipes are wired into launcher",
                 )
             )
     return checks
@@ -973,8 +1074,11 @@ def _cuda_version_tuple(value: Any) -> tuple[int, int] | None:
     return None
 
 
-def supports_sm90(architectures: str | Iterable[str] | None) -> bool:
-    """Recognize common PyTorch/NVCC spellings for Hopper code."""
+def supports_cuda_capability(
+    architectures: str | Iterable[str] | None,
+    capability: tuple[int, int],
+) -> bool:
+    """Recognize common PyTorch/NVCC spellings for a CUDA capability."""
 
     if architectures is None:
         return False
@@ -982,13 +1086,24 @@ def supports_sm90(architectures: str | Iterable[str] | None) -> bool:
         values = re.split(r"[\s,;]+", architectures)
     else:
         values = [str(value) for value in architectures]
+    major, minor = capability
+    compact = f"{major}{minor}"
     for value in values:
         normalized = value.strip().lower().replace("+ptx", "")
-        if re.search(r"(?:sm|compute)[_-]?90a?(?:$|[^0-9])", normalized):
+        if re.search(
+            rf"(?:sm|compute)[_-]?{compact}a?(?:$|[^0-9])",
+            normalized,
+        ):
             return True
-        if re.fullmatch(r"9\.0a?", normalized):
+        if re.fullmatch(rf"{major}\.{minor}a?", normalized):
             return True
     return False
+
+
+def supports_sm90(architectures: str | Iterable[str] | None) -> bool:
+    """Recognize common PyTorch/NVCC spellings for Hopper code."""
+
+    return supports_cuda_capability(architectures, (9, 0))
 
 
 def _xformers_checks(
@@ -1182,6 +1297,7 @@ def _optional_checks(checks: Iterable[Check]) -> list[Check]:
 def _attention_and_model_checks(
     torch: Any,
     project_root: Path,
+    variant: str = "real",
 ) -> list[Check]:
     checks: list[Check] = []
     try:
@@ -1303,8 +1419,13 @@ def _attention_and_model_checks(
     )
 
     try:
+        model_filenames = {
+            "real": "optibertneo-198m.yaml",
+            "multispace": "optibertneo-198m-multispace.yaml",
+        }
+        expected_space = "real" if variant == "real" else "multispace"
         model_values = load_flat_yaml(
-            project_root / "conf" / "model" / "optibertneo-198m.yaml"
+            project_root / "conf" / "model" / model_filenames[variant]
         )
         config = config_class(
             vocab_size=50_265,
@@ -1324,7 +1445,7 @@ def _attention_and_model_checks(
         total = sum(parameter.numel() for parameter in unique.values())
         spaces = set(config.attention_spaces)
         backends = set(config.attention_backends)
-        if spaces != {"real"} or backends != {"flex"}:
+        if spaces != {expected_space} or backends != {"flex"}:
             raise RuntimeError(
                 f"spaces={sorted(spaces)}, backends={sorted(backends)}"
             )
@@ -1348,7 +1469,7 @@ def _attention_and_model_checks(
             Check(
                 "model.runtime_count",
                 PASS,
-                f"all 28 layers are real/Flex; {non_embedding:,} "
+                f"all 28 layers are {expected_space}/Flex; {non_embedding:,} "
                 f"non-embedding and {total:,} total unique parameters",
             )
         )
@@ -1359,9 +1480,14 @@ def _gpu_checks(
     torch: Any,
     *,
     expected_gpus_per_node: int,
-    require_h100: bool,
+    required_gpu: str | None,
 ) -> list[Check]:
     checks: list[Check] = []
+    device_contracts = {
+        "a100": ("A100", (8, 0)),
+        "h100": ("H100", (9, 0)),
+    }
+    device_contract = device_contracts.get(required_gpu)
     if getattr(torch.version, "cuda", None) is None:
         return [
             Check("cuda.build", FAIL, "PyTorch was not built with CUDA"),
@@ -1414,31 +1540,27 @@ def _gpu_checks(
         arch_list = tuple(torch.cuda.get_arch_list())
     except Exception as error:
         checks.append(
-            Check("cuda.build_sm90", FAIL, f"cannot query arch list: {error}")
+            Check("cuda.build_arch", FAIL, f"cannot query arch list: {error}")
         )
         arch_list = ()
-    if require_h100 and not supports_sm90(arch_list):
+    if device_contract is None:
         checks.append(
             Check(
-                "cuda.build_sm90",
-                FAIL,
-                f"PyTorch build lacks sm_90/compute_90 ({arch_list})",
-            )
-        )
-    elif supports_sm90(arch_list):
-        checks.append(
-            Check(
-                "cuda.build_sm90",
-                PASS,
-                f"PyTorch architectures include SM90 ({', '.join(arch_list)})",
+                "cuda.build_arch",
+                PASS if arch_list else WARN,
+                ", ".join(arch_list) or "architecture list is empty",
             )
         )
     else:
+        _, required_capability = device_contract
+        architecture = f"sm_{required_capability[0]}{required_capability[1]}"
+        supported = supports_cuda_capability(arch_list, required_capability)
         checks.append(
             Check(
-                "cuda.build_sm90",
-                WARN,
-                f"SM90 is not in PyTorch's architecture list ({arch_list})",
+                f"cuda.build_{architecture}",
+                PASS if supported else FAIL,
+                f"PyTorch {'includes' if supported else 'lacks'} {architecture} "
+                f"({', '.join(arch_list)})",
             )
         )
 
@@ -1452,20 +1574,22 @@ def _gpu_checks(
             device_errors.append(f"cuda:{index}: {error}")
             continue
         descriptions.append(f"cuda:{index}={name} sm_{capability[0]}{capability[1]}")
-        if require_h100 and (
-            "H100" not in name.upper() or capability != (9, 0)
+        if device_contract is not None and (
+            device_contract[0] not in name.upper()
+            or capability != device_contract[1]
         ):
             device_errors.append(
                 f"cuda:{index} is {name} with capability {capability}, "
-                "expected NVIDIA H100 SM90"
+                f"expected NVIDIA {device_contract[0]} "
+                f"SM{device_contract[1][0]}{device_contract[1][1]}"
             )
     if device_errors:
-        checks.append(Check("cuda.h100_devices", FAIL, "; ".join(device_errors)))
+        checks.append(Check("cuda.devices", FAIL, "; ".join(device_errors)))
     else:
         checks.append(
             Check(
-                "cuda.h100_devices",
-                PASS if require_h100 else WARN,
+                "cuda.devices",
+                PASS if device_contract is not None else WARN,
                 ", ".join(descriptions) or "no devices enumerated",
             )
         )
@@ -1781,6 +1905,7 @@ def validate_optibertneo_manifest(
         expected_packing = {
             "padding_free": True,
             "cross_document_attention": False,
+            "document_ids": True,
             "document_id_padding_value": None,
         }
         for key, expected in expected_packing.items():
@@ -1822,6 +1947,35 @@ def validate_optibertneo_manifest(
             "source_token_limit="
             f"{manifest.get('source_token_limit')!r}, expected 1600000000"
         )
+    if manifest.get("source_rows") != EXPECTED_SOURCE_ROWS:
+        source_mismatches.append(
+            f"source_rows={manifest.get('source_rows')!r}, expected "
+            f"{EXPECTED_SOURCE_ROWS}"
+        )
+    if manifest.get("source_total_rows") != EXPECTED_SOURCE_ROWS:
+        source_mismatches.append(
+            f"source_total_rows={manifest.get('source_total_rows')!r}, expected "
+            f"{EXPECTED_SOURCE_ROWS}"
+        )
+    selected_source_rows = manifest.get("selected_source_rows")
+    if (
+        not isinstance(selected_source_rows, int)
+        or isinstance(selected_source_rows, bool)
+        or not 0 < selected_source_rows <= EXPECTED_SOURCE_ROWS
+    ):
+        source_mismatches.append(
+            "selected_source_rows must be a positive integer no larger than "
+            f"{EXPECTED_SOURCE_ROWS}"
+        )
+    selected_source_tokens = manifest.get("selected_source_tokens")
+    if (
+        not isinstance(selected_source_tokens, int)
+        or isinstance(selected_source_tokens, bool)
+        or selected_source_tokens < 1_600_000_000
+    ):
+        source_mismatches.append(
+            "selected_source_tokens must be an integer at least 1600000000"
+        )
     fingerprint = manifest.get("dataset_fingerprint")
     if not isinstance(fingerprint, str) or not fingerprint:
         source_mismatches.append("dataset_fingerprint is missing")
@@ -1846,7 +2000,7 @@ def validate_optibertneo_manifest(
             Check(
                 "dataset.manifest.source",
                 PASS,
-                "pinned FineWeb-Edu sample-10BT revision v1.0.0",
+                "FineWeb-Edu sample-10BT commit and selected prefix are pinned",
             )
         )
 
@@ -1878,7 +2032,11 @@ def validate_optibertneo_manifest(
             )
         )
 
-    schedule = manifest.get("paper_schedule")
+    schedule = manifest.get("training_schedule")
+    legacy_schedule = False
+    if not isinstance(schedule, dict):
+        schedule = manifest.get("paper_schedule")
+        legacy_schedule = isinstance(schedule, dict)
     schedule_mismatches = []
     expected_schedule = {
         "optimizer_steps": TRAINING_STEPS,
@@ -1886,12 +2044,12 @@ def validate_optibertneo_manifest(
         "required_token_positions": SCHEDULED_TOKENS,
     }
     if not isinstance(schedule, dict):
-        schedule_mismatches.append("paper_schedule is not an object")
+        schedule_mismatches.append("training_schedule is not an object")
     else:
         for key, expected in expected_schedule.items():
             if schedule.get(key) != expected:
                 schedule_mismatches.append(
-                    f"paper_schedule.{key}={schedule.get(key)!r}, "
+                    f"training_schedule.{key}={schedule.get(key)!r}, "
                     f"expected {expected!r}"
                 )
     if schedule_mismatches:
@@ -1906,8 +2064,13 @@ def validate_optibertneo_manifest(
         checks.append(
             Check(
                 "dataset.manifest.schedule",
-                PASS,
-                f"{TRAINING_STEPS} steps x {GLOBAL_SEQUENCES} sequences",
+                WARN if legacy_schedule else PASS,
+                (
+                    "legacy paper_schedule accepted; rebuild to record "
+                    "training_schedule"
+                    if legacy_schedule
+                    else f"{TRAINING_STEPS} steps x {GLOBAL_SEQUENCES} sequences"
+                ),
             )
         )
     return checks
@@ -2320,9 +2483,15 @@ def build_parser() -> argparse.ArgumentParser:
     project_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(
         description=(
-            "Read-only preflight for the real-space OptiBERTneo "
+            "Read-only preflight for the paired OptiBERTneo "
             "1.3B-token run"
         )
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("real", "multispace"),
+        default="real",
+        help="model whose runtime graph is checked (default: real)",
     )
     parser.add_argument(
         "--config-only",
@@ -2339,10 +2508,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="require CUDA, BF16, and the expected number of local GPUs",
     )
-    parser.add_argument(
+    gpu_type = parser.add_mutually_exclusive_group()
+    gpu_type.add_argument(
+        "--require-a100",
+        action="store_true",
+        help="also require every visible GPU and PyTorch to support A100/SM80",
+    )
+    gpu_type.add_argument(
         "--require-h100",
         action="store_true",
-        help="also require every visible GPU and both builds to support H100/SM90",
+        help="also require every visible GPU and PyTorch to support H100/SM90",
     )
     parser.add_argument(
         "--expected-nodes",
@@ -2437,7 +2612,17 @@ def run_preflight(args: argparse.Namespace) -> Report:
 
     if torch is not None:
         report.extend(_torch_source_checks(torch, pytorch_source))
-        report.extend(_attention_and_model_checks(torch, project_root))
+        report.extend(
+            _attention_and_model_checks(torch, project_root, args.variant)
+        )
+        if args.variant == "multispace":
+            report.warned(
+                "attention.multispace_flex_memory",
+                "the dual-number tangent path currently materializes a dense "
+                "B x H x S x S mask/JVP; the configured microbatch 8 passed a "
+                "full 28-layer, sequence-length-1024 A40 smoke, but must still "
+                "pass the target-allocation gate before training",
+            )
     else:
         report.skipped("torch.runtime", "torch did not import")
 
@@ -2446,7 +2631,10 @@ def run_preflight(args: argparse.Namespace) -> Report:
     else:
         report.skipped("triton.pins", "triton did not import")
 
-    require_gpu = bool(args.require_gpu or args.require_h100)
+    required_gpu = (
+        "a100" if args.require_a100 else "h100" if args.require_h100 else None
+    )
+    require_gpu = bool(args.require_gpu or required_gpu)
     if xformers is not None and torch is not None:
         report.extend(
             _optional_checks(
@@ -2461,7 +2649,7 @@ def run_preflight(args: argparse.Namespace) -> Report:
     else:
         report.skipped(
             "xformers.build",
-            "optional xFormers metadata unavailable; real model uses "
+            "optional xFormers metadata unavailable; paired models use "
             "fused_swiglu=false",
         )
 
@@ -2487,13 +2675,13 @@ def run_preflight(args: argparse.Namespace) -> Report:
                 _gpu_checks(
                     torch,
                     expected_gpus_per_node=args.expected_gpus_per_node,
-                    require_h100=bool(args.require_h100),
+                    required_gpu=required_gpu,
                 )
             )
     else:
         report.skipped(
             "cuda.runtime",
-            "GPU checks require --require-gpu or --require-h100",
+            "GPU checks require --require-gpu, --require-a100, or --require-h100",
         )
 
     # Dataset preparation also runs under Slurm, but intentionally uses a
@@ -2528,6 +2716,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.config_only and (
         args.dataset is not None
         or args.require_gpu
+        or args.require_a100
         or args.require_h100
         or args.check_slurm
     ):

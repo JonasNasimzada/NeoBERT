@@ -1,4 +1,4 @@
-"""Hydra entry point for the equal-parameter attention ablation."""
+"""Hydra entry point for the controlled, equal-token attention ablation."""
 
 import hydra
 from omegaconf import DictConfig

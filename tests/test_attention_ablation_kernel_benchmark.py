@@ -39,8 +39,8 @@ class TestPaperProtocols(unittest.TestCase):
         fa1 = [case for case in cases if case.protocol == "fa1-e6"]
         fa2 = [case for case in cases if case.protocol == "fa2-4.1"]
 
-        self.assertEqual(len(fa1), 12 * 10 * 2 * 2)
-        self.assertEqual(len(fa2), 12 * 2 * 6 * 2)
+        self.assertEqual(len(fa1), 11 * 10 * 2 * 2)
+        self.assertEqual(len(fa2), 11 * 2 * 6 * 2)
         self.assertEqual(
             {case.variant for case in cases},
             set(benchmark.DEFAULT_VARIANTS),
@@ -133,7 +133,7 @@ class TestPaperProtocols(unittest.TestCase):
             benchmark._attention_callable(case)
 
     def test_split_and_dual_flash_dropout_are_explicitly_unsupported(self):
-        for variant in ("split-flash", "dual-flash", "dual-flash-fused"):
+        for variant in ("split-flash", "dual-flash"):
             with self.subTest(variant=variant):
                 case = benchmark.BenchmarkCase(
                     protocol="fa1-e6",
@@ -213,13 +213,9 @@ class TestAccounting(unittest.TestCase):
         dual_flash = benchmark._base_row(
             self.make_case(variant="dual-flash"), element_size=2
         )
-        dual_flash_fused = benchmark._base_row(
-            self.make_case(variant="dual-flash-fused"), element_size=2
-        )
         self.assertIn("one-packed-split-complex", split_flash["backend_target"])
-        self.assertIn("dense-analytic-tangent", dual_flash["backend_target"])
         self.assertEqual(
-            dual_flash_fused["backend_target"],
+            dual_flash["backend_target"],
             "triton-fused-dual-flash",
         )
         self.assertIsNone(real["backend_effective"])

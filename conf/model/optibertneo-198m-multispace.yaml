@@ -1,0 +1,25 @@
+hidden_size: 768
+num_hidden_layers: 28
+num_attention_heads: 12
+# NeoBERT's SwiGLU rule maps this nominal width to 1024 effective units.
+intermediate_size: 1536
+rope: true
+rms_norm: true
+embedding_rms_norm: true
+hidden_act: swiglu
+fused_swiglu: false
+dropout: 0
+attention_dropout: 0
+norm_eps: 1e-05
+embedding_init_range: 0.02
+decoder_init_range: 0.02
+tie_word_embeddings: true
+lm_head_bias: false
+ngpt: false
+
+# Every layer contains four ordinary-complex, four split-complex, and four
+# dual-number heads. Both components from all heads are concatenated before a
+# single shared output projection, matching ordinary multi-head attention.
+attention_space: multispace
+attention_backend: flex
+multispace_cuda_streams: true

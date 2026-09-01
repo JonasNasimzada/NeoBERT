@@ -1,0 +1,25 @@
+hidden_size: 768
+num_hidden_layers: 9
+num_attention_heads: 12
+intermediate_size: 2464
+rope: true
+rms_norm: true
+embedding_rms_norm: false
+hidden_act: gelu
+fused_swiglu: false
+dropout: 0
+attention_dropout: 0
+norm_eps: 1e-05
+embedding_init_range: 0.02
+decoder_init_range: 0.02
+tie_word_embeddings: true
+lm_head_bias: false
+ngpt: false
+
+# Standard-MHA-style multispace attention in every layer: four heads each use
+# ordinary-complex, split-complex, and dual-number FlashAttention. Both scalar
+# components of every head are concatenated and mixed by one shared output
+# projection, with no averaging, gating, or per-space readout.
+attention_space: multispace
+attention_backend: flash
+multispace_cuda_streams: true

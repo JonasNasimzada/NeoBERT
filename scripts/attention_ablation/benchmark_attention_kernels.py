@@ -43,7 +43,6 @@ DEFAULT_VARIANTS = (
     "dual-native",
     "dual-torch",
     "dual-flash",
-    "dual-flash-fused",
 )
 ALL_VARIANTS = DEFAULT_VARIANTS
 
@@ -123,7 +122,6 @@ VARIANT_SPECS = {
     "dual-native": VariantSpec("dual_number", "native", 2, 3.0),
     "dual-torch": VariantSpec("dual_number", "torch", 2, 3.0),
     "dual-flash": VariantSpec("dual_number", "flash", 2, 3.0),
-    "dual-flash-fused": VariantSpec("dual_number", "flash_fused", 2, 3.0),
 }
 BACKEND_TARGETS = {
     "complex-native": "pytorch-sdpa-math-packed-complex",
@@ -136,8 +134,7 @@ BACKEND_TARGETS = {
     "real-flash": "pytorch-sdpa-flash",
     "dual-native": "custom-aten-dual-number",
     "dual-torch": "pytorch-jvp-sdpa",
-    "dual-flash": "pytorch-sdpa-flash-primal-plus-dense-analytic-tangent",
-    "dual-flash-fused": "triton-fused-dual-flash",
+    "dual-flash": "triton-fused-dual-flash",
 }
 
 

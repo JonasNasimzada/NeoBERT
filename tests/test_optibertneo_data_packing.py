@@ -32,6 +32,30 @@ SPEC.loader.exec_module(preprocess)
 
 
 class TestPaddingFreePacking(unittest.TestCase):
+    def test_source_prefix_records_exact_selected_rows_and_tokens(self):
+        source = Dataset.from_dict(
+            {
+                "text": ["one", "two", "three"],
+                "token_count": [3, 4, 5],
+            }
+        )
+        metadata = {}
+
+        selected = preprocess.select_approx_token_limit(
+            source,
+            7,
+            metadata,
+        )
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(
+            metadata,
+            {
+                "selected_source_rows": 2,
+                "selected_source_tokens": 7,
+            },
+        )
+
     def test_expected_source_rows_guard_rejects_partial_corpus(self):
         source = Dataset.from_dict({"text": ["one", "two", "three"]})
 
@@ -222,6 +246,8 @@ class TestPaddingFreePacking(unittest.TestCase):
                 TokenizerStub(),
                 config,
                 source_rows=3,
+                selected_source_rows=2,
+                selected_source_tokens=8,
             )
 
             self.assertTrue((output_path / "dataset_info.json").is_file())
@@ -235,6 +261,9 @@ class TestPaddingFreePacking(unittest.TestCase):
             )
             self.assertEqual(manifest["rows"], 2)
             self.assertEqual(manifest["source_rows"], 3)
+            self.assertEqual(manifest["source_total_rows"], 3)
+            self.assertEqual(manifest["selected_source_rows"], 2)
+            self.assertEqual(manifest["selected_source_tokens"], 8)
             self.assertEqual(manifest["sequence_length"], 4)
             self.assertEqual(manifest["packed_token_positions"], 8)
             self.assertTrue(manifest["packing"]["padding_free"])
@@ -342,6 +371,74 @@ class TestPaddingFreePacking(unittest.TestCase):
                 manifest["packing"]["cross_document_attention"]
             )
             self.assertFalse(manifest["packing"]["document_ids"])
+
+    def test_configured_training_schedule_is_recorded_in_manifest(self):
+        class TokenizerStub:
+            bos_token_id = None
+            pad_token_id = 0
+            eos_token_id = None
+            mask_token_id = 103
+
+            def __len__(self):
+                return 30_522
+
+            def save_pretrained(self, path):
+                path.mkdir(parents=True)
+                (path / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+
+        dataset = DatasetDict(
+            {
+                "train": Dataset.from_dict({"input_ids": [[101, 10, 11, 102]]}),
+                "validation": Dataset.from_dict(
+                    {"input_ids": [[101, 20, 21, 102]]}
+                ),
+            }
+        )
+        schedule = {
+            "optimizer_steps": 2,
+            "global_sequences": 1,
+            "required_token_positions": 8,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "prepared"
+            config = OmegaConf.create(
+                {
+                    "dataset": {
+                        "name": "fineweb_edu",
+                        "path_to_disk": str(output_path),
+                        "pack_to_length": 4,
+                        "cross_document_attention": True,
+                        "train_split": "train",
+                        "training_schedule": schedule,
+                        "train": {
+                            "path": "HuggingFaceFW/fineweb-edu",
+                            "name": "sample-10BT",
+                            "split": "train",
+                            "revision": "pinned-test-revision",
+                        },
+                    },
+                    "tokenizer": {
+                        "pretrained_model_name_or_path": (
+                            "google-bert/bert-base-uncased"
+                        ),
+                        "revision": "tokenizer-test-revision",
+                    },
+                }
+            )
+
+            preprocess.save_preprocessed_dataset(
+                dataset,
+                TokenizerStub(),
+                config,
+            )
+            manifest = json.loads(
+                (output_path / "optibertneo_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(manifest["training_schedule"], schedule)
+            self.assertNotIn("paper_schedule", manifest)
 
 
 if __name__ == "__main__":

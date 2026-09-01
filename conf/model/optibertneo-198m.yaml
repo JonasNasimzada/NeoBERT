@@ -14,5 +14,6 @@ embedding_init_range: 0.02
 decoder_init_range: 0.02
 tie_word_embeddings: true
 lm_head_bias: false
+ngpt: false
 attention_space: real
 attention_backend: flex

@@ -14,10 +14,10 @@ ATTENTION_VARIANTS=(
     dual-native
     dual-torch
     dual-flash
-    dual-flash-fused
+    multispace-flash
 )
-ATTENTION_SPACES=(complex complex complex split split real real split dual dual dual dual)
-ATTENTION_BACKENDS=(native torch flash native torch torch flash flash native torch flash flash_fused)
+ATTENTION_SPACES=(complex complex complex split split real real split dual dual dual multispace)
+ATTENTION_BACKENDS=(native torch flash native torch torch flash flash native torch flash flash)
 MODEL_CONFIGS=(
     attention-ablation-complex
     attention-ablation-complex
@@ -30,7 +30,7 @@ MODEL_CONFIGS=(
     attention-ablation-dual
     attention-ablation-dual
     attention-ablation-dual
-    attention-ablation-dual
+    attention-ablation-multispace
 )
 
 # Equal-step/equal-token budget for the controlled twelve-way sweep. The 1,024
@@ -144,7 +144,10 @@ required = (
     "deepspeed",
     "wandb",
 )
-if os.environ.get("ATTENTION_BACKEND") == "flash_fused":
+if (
+    os.environ.get("ATTENTION_SPACE") in ("dual", "multispace")
+    and os.environ.get("ATTENTION_BACKEND") in ("flash", "flash_fused")
+):
     required += ("triton",)
 print(" ".join(name for name in required if importlib.util.find_spec(name) is None))
 ')"

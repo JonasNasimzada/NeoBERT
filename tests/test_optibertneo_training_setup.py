@@ -67,13 +67,16 @@ class TestRecipeAndModelMath(unittest.TestCase):
 
         self.assertEqual(report.exit_code, 1)
 
-    def test_real_model_count_matches_shipped_inspector(self):
-        counts = preflight.calculate_real_model_counts()
+    def test_paired_model_counts_match_shipped_inspector(self):
+        real = preflight.calculate_real_model_counts()
+        multispace = preflight.calculate_multispace_model_counts()
 
-        self.assertEqual(counts.paper_target, 198_180_864)
-        self.assertEqual(counts.non_embedding, 198_225_408)
-        self.assertEqual(counts.total, 236_828_928)
-        self.assertLess(abs(counts.relative_paper_difference), 0.001)
+        for counts in (real, multispace):
+            self.assertEqual(counts.paper_target, 198_180_864)
+            self.assertEqual(counts.non_embedding, 198_225_408)
+            self.assertEqual(counts.total, 236_828_928)
+            self.assertLess(abs(counts.relative_paper_difference), 0.001)
+        self.assertEqual(real, multispace)
 
     def test_shipped_configuration_and_launcher_are_consistent(self):
         checks = preflight._configuration_checks(NEOBERT_ROOT)
@@ -137,6 +140,10 @@ class TestDatasetValidation(unittest.TestCase):
             "format_version": 1,
             "source": dict(preflight.DATASET_SOURCE),
             "source_token_limit": 1_600_000_000,
+            "source_rows": preflight.EXPECTED_SOURCE_ROWS,
+            "source_total_rows": preflight.EXPECTED_SOURCE_ROWS,
+            "selected_source_rows": 5_000_000,
+            "selected_source_tokens": 1_600_000_001,
             "dataset_fingerprint": "synthetic-fingerprint",
             "rows": 1_269_760,
             "sequence_length": 1024,
@@ -144,10 +151,11 @@ class TestDatasetValidation(unittest.TestCase):
             "packing": {
                 "padding_free": True,
                 "cross_document_attention": False,
+                "document_ids": True,
                 "document_id_padding_value": None,
             },
             "tokenizer": dict(preflight.TOKENIZER_IDENTITY),
-            "paper_schedule": {
+            "training_schedule": {
                 "optimizer_steps": 620,
                 "global_sequences": 2048,
                 "required_token_positions": 1_300_234_240,
@@ -173,7 +181,7 @@ class TestDatasetValidation(unittest.TestCase):
         manifest["packing"]["padding_free"] = False
         manifest["source"]["revision"] = "main"
         manifest["tokenizer"]["mask_token_id"] = 3
-        manifest["paper_schedule"]["optimizer_steps"] = 619
+        manifest["training_schedule"]["optimizer_steps"] = 619
 
         checks = preflight.validate_optibertneo_manifest(
             manifest,
@@ -327,6 +335,16 @@ class TestEnvironmentValidators(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(preflight.supports_sm90(value))
         self.assertFalse(preflight.supports_sm90("8.0;8.6+PTX"))
+
+    def test_sm80_architecture_spellings(self):
+        for value in ("sm_80", "compute_80", "8.0", "8.0+PTX"):
+            with self.subTest(value=value):
+                self.assertTrue(
+                    preflight.supports_cuda_capability(value, (8, 0))
+                )
+        self.assertFalse(
+            preflight.supports_cuda_capability("8.6;9.0", (8, 0))
+        )
 
     def test_cuda_build_version_encodings(self):
         self.assertEqual(preflight._cuda_version_tuple(1201), (12, 1))

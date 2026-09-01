@@ -10,6 +10,7 @@ harness.  It is installed only inside the optional evaluator subprocess.
 from __future__ import annotations
 
 import types
+from collections import defaultdict
 
 import torch
 from torch.nn import functional as F
@@ -59,7 +60,7 @@ def install_padding_free_flash_forward(model):
             )
 
         batch_size, padded_length = input_ids.shape
-        padded_logits = []
+        rows_by_length = defaultdict(list)
         for row_index in range(batch_size):
             valid = attention_mask[row_index].bool()
             true_length = int(valid.sum().item())
@@ -69,24 +70,34 @@ def install_padding_free_flash_forward(model):
                 raise ValueError(
                     "the BabyLM Flash adapter supports right padding only"
                 )
+            rows_by_length[true_length].append(row_index)
 
+        padded_logits = [None] * batch_size
+        for true_length, row_indices in rows_by_length.items():
+            indices = torch.tensor(
+                row_indices,
+                dtype=torch.long,
+                device=input_ids.device,
+            )
             row_kwargs = {}
             for name, value in kwargs.items():
                 if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
-                    value = value[row_index : row_index + 1]
+                    value = value.index_select(0, indices)
                     if value.ndim >= 2 and value.shape[1] == padded_length:
                         value = value[:, :true_length]
                 row_kwargs[name] = value
 
             output = original_forward(
-                input_ids=input_ids[row_index : row_index + 1, :true_length],
+                input_ids=input_ids.index_select(0, indices)[:, :true_length],
                 attention_mask=None,
                 **row_kwargs,
             )
             logits = output.logits if hasattr(output, "logits") else output[0]
-            padded_logits.append(
-                F.pad(logits, (0, 0, 0, padded_length - true_length))
-            )
+            for group_index, row_index in enumerate(row_indices):
+                padded_logits[row_index] = F.pad(
+                    logits[group_index : group_index + 1],
+                    (0, 0, 0, padded_length - true_length),
+                )
 
         return MaskedLMOutput(logits=torch.cat(padded_logits, dim=0))
 

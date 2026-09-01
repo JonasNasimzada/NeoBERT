@@ -26,7 +26,11 @@ from transformers.modeling_outputs import MaskedLMOutput, SequenceClassifierOutp
 
 from tqdm import tqdm
 
-from .complex_attention import NeoBERTComplexAttention
+from .complex_attention import (
+    MultiSpaceStreamPool,
+    NeoBERTComplexAttention,
+    NeoBERTMultiSpaceAttention,
+)
 from .rmsnorm import RMSNorm
 from .rotary import precompute_freqs_cis, apply_rotary_emb
 
@@ -187,7 +191,7 @@ def _prepare_backend_padding_metadata(key_padding_mask, attention_spaces, attent
         return None
     needs_metadata = any(
         backend in ("flash", "flash_fused")
-        and space in ("real", "complex", "split", "dual")
+        and space in ("real", "complex", "split", "dual", "multispace")
         for space, backend in zip(attention_spaces, attention_backends)
     )
     if not needs_metadata:
@@ -271,6 +275,7 @@ class NeoBERTConfig(PretrainedConfig):
         attention_backend: str = "auto",
         attention_spaces: Optional[List[str]] = None,
         attention_backends: Optional[List[str]] = None,
+        multispace_cuda_streams: bool = True,
         base_scale: float = 1.0 / (960.0**0.5),
         ngpt: bool = False,
         embedding_rms_norm: bool = False,
@@ -317,7 +322,9 @@ class NeoBERTConfig(PretrainedConfig):
         if flash_attention is not None and not isinstance(flash_attention, bool):
             raise ValueError("flash_attention must be a bool or None")
         self.flash_attention = flash_attention
-        valid_spaces = ("real", "complex", "split", "dual")
+        if not isinstance(multispace_cuda_streams, bool):
+            raise ValueError("multispace_cuda_streams must be a bool")
+        valid_spaces = ("real", "complex", "split", "dual", "multispace")
         valid_backends = (
             "auto", "native", "torch", "flash", "flash_fused", "flex"
         )
@@ -326,10 +333,11 @@ class NeoBERTConfig(PretrainedConfig):
             "complex": ("auto", "native", "torch", "flash", "flex"),
             "split": ("auto", "native", "torch", "flash", "flex"),
             "dual": ("auto", "native", "torch", "flash", "flash_fused", "flex"),
+            "multispace": ("flash", "flex"),
         }
         if attention_space not in valid_spaces:
             raise ValueError(
-                "attention_space must be 'real', 'complex', 'split', or 'dual'"
+                "attention_space must be 'real', 'complex', 'split', 'dual', or 'multispace'"
             )
         if attention_backend not in valid_backends:
             raise ValueError(
@@ -362,11 +370,30 @@ class NeoBERTConfig(PretrainedConfig):
                     "complex": "ordinary complex",
                     "split": "split-complex",
                     "dual": "dual-number",
+                    "multispace": "multispace",
                 }[layer_space]
                 allowed = supported_backends[layer_space]
+                allowed_text = (
+                    allowed[0]
+                    if len(allowed) == 1
+                    else f"{', '.join(allowed[:-1])}, or {allowed[-1]}"
+                )
                 raise ValueError(
-                    f"{space_name} layers support only "
-                    f"{', '.join(allowed[:-1])}, or {allowed[-1]}"
+                    f"{space_name} layers support only {allowed_text}"
+                )
+            if layer_space == "multispace" and num_attention_heads % 3 != 0:
+                raise ValueError(
+                    "multispace attention requires num_attention_heads to be "
+                    "divisible by 3"
+                )
+            if (
+                layer_space == "multispace"
+                and layer_backend == "flash"
+                and self.dim_head > 128
+            ):
+                raise ValueError(
+                    "multispace FlashAttention requires attention head "
+                    "dimensions no larger than 128"
                 )
             if (
                 attention_dropout > 0.0
@@ -393,10 +420,16 @@ class NeoBERTConfig(PretrainedConfig):
                 raise ValueError(
                     "dual-number FlashAttention does not support attention_dropout"
                 )
+            if attention_dropout > 0.0 and layer_space == "multispace":
+                raise ValueError(
+                    "multispace FlashAttention and FlexAttention do not support "
+                    "attention_dropout"
+                )
         self.attention_space = attention_space
         self.attention_backend = attention_backend
         self.attention_spaces = list(attention_spaces)
         self.attention_backends = list(attention_backends)
+        self.multispace_cuda_streams = multispace_cuda_streams
         self.base_scale = base_scale
         self.ngpt = ngpt
         self.embedding_rms_norm = embedding_rms_norm
@@ -408,7 +441,12 @@ class NeoBERTConfig(PretrainedConfig):
 class EncoderBlock(nn.Module):
     """Transformer encoder block."""
 
-    def __init__(self, config: NeoBERTConfig, layer_index: int):
+    def __init__(
+        self,
+        config: NeoBERTConfig,
+        layer_index: int,
+        stream_pool: Optional[MultiSpaceStreamPool] = None,
+    ):
         super().__init__()
 
         self.config = config
@@ -421,6 +459,14 @@ class EncoderBlock(nn.Module):
             self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
             self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
             self.complex_attention = None
+        elif self.attention_space == "multispace":
+            self.qkv = None
+            self.wo = None
+            self.complex_attention = NeoBERTMultiSpaceAttention(
+                config,
+                self.attention_backend,
+                stream_pool,
+            )
         else:
             self.qkv = None
             self.wo = None
@@ -754,7 +800,10 @@ class NeoBERTPreTrainedModel(PreTrainedModel):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.uniform_(-self.config.embedding_init_range, self.config.embedding_init_range)
-        elif isinstance(module, NeoBERTComplexAttention):
+        elif isinstance(
+            module,
+            (NeoBERTComplexAttention, NeoBERTMultiSpaceAttention),
+        ):
             module.reset_parameters(self.config.decoder_init_range)
 
 
@@ -787,8 +836,11 @@ class NeoBERT(NeoBERTPreTrainedModel):
             self.positional_embedding = nn.Embedding(config.max_length + 1, config.hidden_size, padding_idx=config.pad_token_id)
 
         self.transformer_encoder = nn.ModuleList()
+        stream_pool = MultiSpaceStreamPool()
         for layer_index in range(config.num_hidden_layers):
-            self.transformer_encoder.append(EncoderBlock(config, layer_index))
+            self.transformer_encoder.append(
+                EncoderBlock(config, layer_index, stream_pool)
+            )
 
         self.layer_norm = (
             RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)

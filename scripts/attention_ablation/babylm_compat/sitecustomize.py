@@ -16,6 +16,11 @@ if os.environ.get("NEOBERT_BABYLM_FORCE_BF16") == "1":
 
     from padding_free_flash import install_padding_free_flash_forward
 
+    _seed = int(os.environ.get("NEOBERT_BABYLM_SEED", "42"))
+    torch.manual_seed(_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_seed)
+
     _original_from_pretrained = AutoModelForMaskedLM.from_pretrained
 
     def _from_pretrained_bf16(cls, *args, **kwargs):

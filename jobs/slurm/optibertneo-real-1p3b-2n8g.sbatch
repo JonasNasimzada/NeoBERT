@@ -73,6 +73,13 @@ export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 export WANDB_MODE=${WANDB_MODE:-offline}
+export MAX_TIME_SECONDS=${MAX_TIME_SECONDS:-13200}
+if [[ ! "$MAX_TIME_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MAX_TIME_SECONDS must be a positive integer, got: $MAX_TIME_SECONDS" >&2
+    exit 2
+fi
+optibert_job_started_epoch=$(date +%s)
+export OPTIBERT_TRAINING_DEADLINE_EPOCH=$((optibert_job_started_epoch + MAX_TIME_SECONDS))
 export OPTIBERT_DATASET=${OPTIBERT_DATASET:-$project_root/tokenized_datasets/fineweb_edu_roberta_1p6b}
 export RUN_ROOT=${RUN_ROOT:-$project_root/logs/optibertneo-real-1p3b/$SLURM_JOB_ID}
 export HF_HOME=${HF_HOME:-$project_root/.cache/huggingface}
@@ -86,7 +93,7 @@ export TRITON_CACHE_DIR=$cache_root/triton
 export TORCHINDUCTOR_CACHE_DIR=$cache_root/inductor
 
 echo "job=$SLURM_JOB_ID nodes=$SLURM_JOB_NUM_NODES master=$MASTER_ADDR:$MASTER_PORT"
-echo "project=$project_root dataset=$OPTIBERT_DATASET run=$RUN_ROOT"
+echo "project=$project_root dataset=$OPTIBERT_DATASET run=$RUN_ROOT max_time_seconds=$MAX_TIME_SECONDS deadline_epoch=$OPTIBERT_TRAINING_DEADLINE_EPOCH"
 
 srun \
     --nodes=2 \

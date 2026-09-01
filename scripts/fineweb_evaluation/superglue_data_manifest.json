@@ -1,0 +1,34 @@
+{
+  "dataset": "aps/super_glue",
+  "dataset_revision": "3de24cf8022e94f4ee4b9d55a6f539891524d646",
+  "download_template": "https://huggingface.co/datasets/aps/super_glue/resolve/{revision}/{config}/{split}-00000-of-00001.parquet",
+  "metric_implementation": {
+    "repository": "https://github.com/huggingface/datasets",
+    "revision": "06c3ffb8d068b6307b247164b10f7c7311cefed4",
+    "tag": "2.14.6",
+    "super_glue.py_sha256": "dbcb97530334cd0798b432a4d02b31f1642a313b7687846b972da03eeaead9a3",
+    "record_evaluation.py_sha256": "4bda909c08d5c9e21ce2d41f04ce5415c5d341976c22119da2905a37d9fca6cf"
+  },
+  "primary_evaluation_split": "validation",
+  "test_split_policy": "Official main-task test labels are hidden; report validation metrics. AX-b and AX-g are labeled diagnostics in this pinned mirror and are excluded from the primary aggregate.",
+  "files": {
+    "axb/test.parquet": {"rows": 1104, "sha256": "655cadf2b23ebf0147984c8809811a82453137ee22f131d802137862ff3f2501"},
+    "axg/test.parquet": {"rows": 356, "sha256": "4ed3eddc728664a79b7b25cbec8aea1528d917f04870116d2ae84fdbc1f80028"},
+    "boolq/train.parquet": {"rows": 9427, "sha256": "41e2ce07ac0d3bcd411bd4b6326bab2cff5fa67bacdbbcea74bb9e001ec635d3"},
+    "boolq/validation.parquet": {"rows": 3270, "sha256": "f46438b8cce048184552a2bfcdb8252eadb3a2602f0c22334caccd9b6ea547d6"},
+    "cb/train.parquet": {"rows": 250, "sha256": "a338d1276fd0248fd4d6648917ef7181f994d85d141b3a2a4fc6a659d69f3a8a"},
+    "cb/validation.parquet": {"rows": 56, "sha256": "36cf71dba8a314d36266b71bb136e3bad9e20c46b8983cf44d4a13d9031d0951"},
+    "copa/train.parquet": {"rows": 400, "sha256": "8e243c3a2428837f5725f19885ddf3a83eecb6874474606a2ca1d1e6dd5bd6d7"},
+    "copa/validation.parquet": {"rows": 100, "sha256": "247a7f586c5cc706eb18a15ad20f1a5b543b9c7af0df4161df138a25edc95d67"},
+    "multirc/train.parquet": {"rows": 27243, "sha256": "ced6d731a335a0e4fbd29f6f382f291518952c0f449448361d294000c39e6728"},
+    "multirc/validation.parquet": {"rows": 4848, "sha256": "5eb64893afc5af7828b2f3b41d6a4574eb7a82cbb17c86c75842f5f95f679ada"},
+    "record/train.parquet": {"rows": 100730, "sha256": "20ae20deb498305cb872b52987c63c46fa08bd97605c6fd78a1553bf8d91a417"},
+    "record/validation.parquet": {"rows": 10000, "sha256": "3662aa327fec7faaf7f47c651941c35ff1643105bf81291168c37a78a37b59a1"},
+    "rte/train.parquet": {"rows": 2490, "sha256": "16c83717da2e5b14cfd75e88b6331ac88d8cbf8f4fcd8bc48941c67ac8e9b3a9"},
+    "rte/validation.parquet": {"rows": 277, "sha256": "b3740aac80522a9a86e9d926287b813531eeabdead967399b1fd899c640fac76"},
+    "wic/train.parquet": {"rows": 5428, "sha256": "d6d2231730f52800dba48219790ee9b76381bbba7c99ea76047081631877ec80"},
+    "wic/validation.parquet": {"rows": 638, "sha256": "22cc5df62bf76c8ed47ea0c92b4bb1bce698984ac1c10493250365d3419ac6da"},
+    "wsc.fixed/train.parquet": {"rows": 554, "sha256": "13086042694cd7550f91f4279fafa8425cead3ed046c6a6cd22d96107f1a1944"},
+    "wsc.fixed/validation.parquet": {"rows": 104, "sha256": "aa64cc8f27c793b60b6263302c26ae49f768a6b90d050e383fc3f99d2080b201"}
+  }
+}

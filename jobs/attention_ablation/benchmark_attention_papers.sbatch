@@ -3,7 +3,7 @@
 #SBATCH --partition=slowlane
 #SBATCH --gpus=A100:1
 #SBATCH --qos=hiwi_project
-#SBATCH --array=0-11
+#SBATCH --array=0-10
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -31,7 +31,7 @@ resolve_attention_variant "${SLURM_ARRAY_TASK_ID:?This job must run as an array 
 setup_attention_runtime
 
 RUNS_ROOT="$(realpath -m "${RUNS_ROOT:-$NEOBERT_ROOT/logs/attention_ablation}")"
-EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-1p376b-v1}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-a100-s1024-multispace-100m-v4}"
 SEED="${SEED:-42}"
 validate_experiment_id "$EXPERIMENT_ID"
 validate_attention_seed "$SEED"
