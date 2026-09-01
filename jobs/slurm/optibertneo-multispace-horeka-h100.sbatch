@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=optibertneo-ms-1p3b
+#SBATCH --job-name=optibertneo-ms-h100
 #SBATCH --account=hk-project-pai00130
-#SBATCH --partition=accelerated
+#SBATCH --partition=accelerated-h100
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-# Legacy HoreKa Green is scheduled to close after 2026-09-15. Migrating this
-# job to HoreKa 2 also requires migrating its /hkfs code, data, and environment.
+# This targets the legacy HoreKa 1 Teal queue. Check its current availability
+# with `sbatch --test-only` before consuming or moving any training state.
 export OPTIBERT_PROJECT_ROOT=/hkfs/home/project/hk-project-pai00012/st_st171793/ComplexAttention/NeoBERT
-export OPTIBERT_REQUIRED_GPU=a100
-export RUN_ROOT=${RUN_ROOT:-$OPTIBERT_PROJECT_ROOT/logs/optibertneo-horeka-1p3b/multispace}
+export OPTIBERT_REQUIRED_GPU=h100
+export RUN_ROOT=${RUN_ROOT:-$OPTIBERT_PROJECT_ROOT/logs/optibertneo-horeka-h100-1p3b/multispace}
 exec "$OPTIBERT_PROJECT_ROOT/jobs/slurm/run-optibertneo-multispace-horeka.sh"
