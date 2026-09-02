@@ -161,3 +161,28 @@ model such as `multispace-300m`. Useful overrides include `TRAIN_SEGMENTS`,
 `MAX_STEPS`, `SEED`, `RUNS_ROOT`, and `PREFLIGHT_JOB_ID`. Keep
 `MICRO_BATCH * GRAD_ACCUM = 16` for equal-batch comparisons, and keep the same
 `MAX_STEPS`, data order, and seed across each real/multispace pair.
+
+### Start training on HoreKa
+
+After the preflight wrapper and prepared DatasetDict are present in the HoreKa
+checkout, use the guarded launcher below. It submits the preflight array after
+job `5125968`, then starts four parallel, resumable training chains only after
+that array succeeds:
+
+```bash
+cd /hkfs/home/project/hk-project-pai00012/st_st171793/ComplexAttention/NeoBERT
+DATASET_PATH=/hkfs/home/project/hk-project-pai00012/st_st171793/ComplexAttention/NeoBERT/tokenized_datasets/fineweb_edu_google_1024_1p6b \
+DRY_RUN=0 CONFIRM_FULL_SUBMISSION=YES \
+  bash jobs/scaled_fineweb/submit-horeka-training.sh all
+```
+
+The launcher uses `attention_dev`, CUDA 12.9, one A100 per model, and defaults
+to micro-batch 1 with gradient accumulation 16 for the 40-GB GPUs. Each
+segment has a two-day Slurm allocation but stops at 169,200 seconds to save a
+checkpoint before the wall-time limit; `TRAIN_SEGMENTS=5` is the default. Use
+`DRY_RUN=1` first to inspect dependencies and paths. The training launcher
+requests the full-context smoke by default; set `FULL_PRODUCTION_GEOMETRY=0`
+for the shorter gate. If job `5125968` has
+already finished, check its state with `sacct`; if it succeeded, set
+`UPSTREAM_JOB_ID=` before submitting, because old job IDs can expire from
+Slurm's dependency window.
