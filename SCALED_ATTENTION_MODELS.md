@@ -216,3 +216,9 @@ DATASET_PATH=/hkfs/home/project/hk-project-pai00012/st_st171793/ComplexAttention
 DRY_RUN=0 CONFIRM_FULL_SUBMISSION=YES \
   bash jobs/scaled_fineweb/submit-horeka-training.sh all
 ```
+
+Do not use `jobs/slurm/prepare-optibertneo-data.sbatch` for this experiment:
+that older job intentionally prepares the RoBERTa-tokenized
+`fineweb_edu_roberta_1p6b` directory. The scaled FlashAttention runs require
+the Google-tokenized `fineweb_edu_google_1024_1p6b` output from
+`prepare-horeka.sbatch` above.
