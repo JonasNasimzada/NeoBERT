@@ -13,8 +13,8 @@
 set -euo pipefail
 
 # Site-specific account, partition, constraint, QoS, and reservation flags
-# deliberately stay on the sbatch command line. The per-node preflight rejects
-# anything other than two nodes with four visible H100s per node.
+# deliberately stay on the sbatch command line. The per-node preflight enforces
+# the accelerator selected through OPTIBERT_REQUIRED_GPU.
 
 variant=${OPTIBERT_VARIANT:?OPTIBERT_VARIANT must be exported as real or multispace}
 case "$variant" in
@@ -36,7 +36,7 @@ project_root=$(cd "$project_root" && pwd)
 complex_root=$(cd "$project_root/.." && pwd)
 
 if [[ -z "${OPTIBERT_PYTHON:-}" ]]; then
-    echo "OPTIBERT_PYTHON must name the executable in the prepared H100 environment." >&2
+    echo "OPTIBERT_PYTHON must name the executable in the prepared accelerator environment." >&2
     exit 1
 fi
 if [[ ! -x "$OPTIBERT_PYTHON" ]]; then

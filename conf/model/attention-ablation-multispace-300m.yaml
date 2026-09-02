@@ -1,0 +1,26 @@
+hidden_size: 768
+num_hidden_layers: 33
+num_attention_heads: 12
+intermediate_size: 2464
+rope: true
+rms_norm: true
+embedding_rms_norm: false
+hidden_act: gelu
+fused_swiglu: false
+dropout: 0
+attention_dropout: 0
+norm_eps: 1e-05
+embedding_init_range: 0.02
+decoder_init_range: 0.02
+tie_word_embeddings: true
+lm_head_bias: false
+ngpt: false
+
+# Every layer has four ordinary-complex, four split-complex, and four
+# dual-number heads. All two-component head outputs are concatenated and mixed
+# by one shared output projection, exactly like ordinary real MHA. This model
+# has 304,101,120 trainable real scalar parameters at vocab_size=30,522. Only
+# depth changes relative to the 100M pair.
+attention_space: multispace
+attention_backend: flash
+multispace_cuda_streams: true

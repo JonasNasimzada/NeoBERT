@@ -98,6 +98,34 @@ class TestRecipeAndModelMath(unittest.TestCase):
         self.assertIn("1,300,234,240 scheduled tokens", output.getvalue())
         self.assertIn("[SKIP] runtime", output.getvalue())
 
+    def test_dataset_only_cli_imports_no_training_runtime(self):
+        modules = {"datasets": object(), "transformers": object()}
+        with (
+            mock.patch.object(
+                preflight,
+                "_import_checks",
+                return_value=([], modules),
+            ) as import_checks,
+            mock.patch.object(preflight, "_dataset_checks", return_value=[]),
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exit_code = preflight.main(
+                    [
+                        "--dataset",
+                        "prepared-dataset",
+                        "--project-root",
+                        str(NEOBERT_ROOT),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0, output.getvalue())
+        imported_modules = {
+            requirement.module for requirement in import_checks.call_args.args[0]
+        }
+        self.assertEqual(imported_modules, {"datasets", "transformers"})
+        self.assertIn("[SKIP] runtime", output.getvalue())
+
     def test_slurm_is_not_inferred_for_dataset_only_runs(self):
         environment = {"SLURM_JOB_ID": "123", "SLURM_JOB_NUM_NODES": "1"}
 
@@ -404,6 +432,25 @@ class TestEnvironmentValidators(unittest.TestCase):
         self.assertFalse(
             preflight.commits_match("deadbee", pins.commit)
         )
+
+    def test_triton_commit_is_read_from_distribution_version(self):
+        triton = mock.Mock(__version__="3.8.0")
+        pins = preflight.TritonPins(
+            "3.8.0",
+            "43422b04287ec4e774e2b1b9316b7eff44219b3f",
+        )
+        with (
+            mock.patch.object(preflight, "read_triton_pins", return_value=pins),
+            mock.patch.object(
+                preflight,
+                "_module_version",
+                return_value="3.8.0+git43422b04",
+            ),
+        ):
+            checks = preflight._triton_checks(triton, Path("pytorch"))
+
+        self.assertEqual(failures(checks), [])
+        self.assertEqual(checks[1].status, preflight.PASS)
 
 
 if __name__ == "__main__":

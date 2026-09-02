@@ -757,10 +757,12 @@ def _module_version(module: Any, distribution: str) -> str | None:
         return str(value) if value is not None else None
 
 
-def _import_checks() -> tuple[list[Check], dict[str, Any]]:
+def _import_checks(
+    requirements: Sequence[ImportRequirement] | None = None,
+) -> tuple[list[Check], dict[str, Any]]:
     checks: list[Check] = []
     modules: dict[str, Any] = {}
-    for requirement in IMPORT_REQUIREMENTS:
+    for requirement in requirements or IMPORT_REQUIREMENTS:
         # DeepSpeed constructs Triton's autotune-cache manager while it is
         # imported.  When callers have not provided a cache directory, that
         # constructor otherwise tries to create ~/.triton/autotune.  Point it
@@ -985,7 +987,7 @@ def _triton_checks(
 ) -> list[Check]:
     checks: list[Check] = []
     pins = read_triton_pins(pytorch_source)
-    actual_version = str(getattr(triton, "__version__", ""))
+    actual_version = _module_version(triton, "triton") or ""
     if pins.version is None:
         checks.append(
             Check(
@@ -2490,8 +2492,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--variant",
         choices=("real", "multispace"),
-        default="real",
-        help="model whose runtime graph is checked (default: real)",
+        help=(
+            "model whose runtime graph is checked; a dataset without a model "
+            "or GPU requirement performs dataset-only validation"
+        ),
     )
     parser.add_argument(
         "--config-only",
@@ -2580,6 +2584,37 @@ def run_preflight(args: argparse.Namespace) -> Report:
         )
         return report
 
+    dataset_only = (
+        args.dataset is not None
+        and args.variant is None
+        and not args.require_gpu
+        and not args.require_a100
+        and not args.require_h100
+        and not args.check_slurm
+        and args.pytorch_source is None
+    )
+    if dataset_only:
+        requirements = tuple(
+            requirement
+            for requirement in IMPORT_REQUIREMENTS
+            if requirement.module in {"datasets", "transformers"}
+        )
+        import_checks, modules = _import_checks(requirements)
+        report.extend(import_checks)
+        report.extend(
+            _dataset_checks(
+                args.dataset.resolve(),
+                modules.get("datasets"),
+                modules.get("transformers"),
+            )
+        )
+        report.skipped(
+            "runtime",
+            "PyTorch, Triton, CUDA, model, and Slurm checks are separate from "
+            "dataset-only validation",
+        )
+        return report
+
     import_checks, modules = _import_checks()
     report.extend(import_checks)
     torch = modules.get("torch")
@@ -2613,7 +2648,11 @@ def run_preflight(args: argparse.Namespace) -> Report:
     if torch is not None:
         report.extend(_torch_source_checks(torch, pytorch_source))
         report.extend(
-            _attention_and_model_checks(torch, project_root, args.variant)
+            _attention_and_model_checks(
+                torch,
+                project_root,
+                args.variant or "real",
+            )
         )
         if args.variant == "multispace":
             report.warned(
