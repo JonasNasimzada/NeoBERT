@@ -147,8 +147,9 @@ DRY_RUN=0 CONFIRM_FULL_SUBMISSION=YES \
   bash jobs/scaled_fineweb/submit.sh all
 ```
 
-By default this also schedules preparation of the repository's 1.6B-token
-FineWeb-Edu dataset. To reuse an already prepared and validated DatasetDict:
+The generic launcher also supports scheduling preparation of the repository's
+1.6B-token FineWeb-Edu dataset. To reuse an already prepared and validated
+DatasetDict:
 
 ```bash
 DATASET_PATH=/absolute/path/to/fineweb_edu_google_1024_1p6b \
@@ -182,7 +183,36 @@ segment has a two-day Slurm allocation but stops at 169,200 seconds to save a
 checkpoint before the wall-time limit; `TRAIN_SEGMENTS=5` is the default. Use
 `DRY_RUN=1` first to inspect dependencies and paths. The training launcher
 requests the full-context smoke by default; set `FULL_PRODUCTION_GEOMETRY=0`
-for the shorter gate. If job `5125968` has
-already finished, check its state with `sacct`; if it succeeded, set
-`UPSTREAM_JOB_ID=` before submitting, because old job IDs can expire from
-Slurm's dependency window.
+for the shorter gate. If job `5125968` has already finished, check its state
+with `sacct`; if it succeeded, set `UPSTREAM_JOB_ID=` before submitting,
+because old job IDs can expire from Slurm's dependency window.
+
+### If the FineWeb-Edu directory is incomplete
+
+The HoreKa launcher deliberately refuses to start training unless both
+`dataset_dict.json` and `optibertneo_manifest.json` exist. Prepare the pinned
+dataset on a CPU node with:
+
+```bash
+cd /hkfs/home/project/hk-project-pai00012/st_st171793/ComplexAttention/NeoBERT
+DATASET_PATH=/hkfs/home/project/hk-project-pai00012/st_st171793/ComplexAttention/NeoBERT/tokenized_datasets/fineweb_edu_google_1024_1p6b \
+  sbatch --parsable jobs/scaled_fineweb/prepare-horeka.sbatch
+```
+
+The preparation job never overwrites an existing directory. If that path is a
+partial failed preparation, choose a new `DATASET_PATH` or inspect it and
+remove it manually only when it is disposable. Once preparation finishes
+successfully, rerun the training command. You can also queue training
+immediately behind a preparation job by passing its ID as `PREP_JOB_ID`; the
+launcher will wait for both preparation and preflight before starting any
+A100 work. If preflight array `5128653` has succeeded, reuse it instead of
+submitting another one:
+
+```bash
+UPSTREAM_JOB_ID= \
+PREP_JOB_ID=<preparation-job-id> \
+PREFLIGHT_JOB_ID=5128653 \
+DATASET_PATH=/hkfs/home/project/hk-project-pai00012/st_st171793/ComplexAttention/NeoBERT/tokenized_datasets/fineweb_edu_google_1024_1p6b \
+DRY_RUN=0 CONFIRM_FULL_SUBMISSION=YES \
+  bash jobs/scaled_fineweb/submit-horeka-training.sh all
+```

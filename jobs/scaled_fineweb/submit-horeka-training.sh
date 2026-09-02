@@ -18,7 +18,7 @@ Required for live training:
 
 Useful overrides:
   SOURCE, MAMBA_ENV, MAMBA_EXE, MAMBA_ROOT_PREFIX
-  PREFLIGHT_JOB_ID, SKIP_PREFLIGHT, TRAIN_SEGMENTS, MAX_STEPS
+  PREP_JOB_ID, PREFLIGHT_JOB_ID, SKIP_PREFLIGHT, TRAIN_SEGMENTS, MAX_STEPS
   MICRO_BATCH (default 1), GRAD_ACCUM (default 16), RUNS_ROOT, SEED
 EOF
     exit 2
@@ -53,6 +53,7 @@ experiment_prefix="${EXPERIMENT_PREFIX:-fineweb-edu-s1024}"
 # dependency after the user has verified that the predecessor completed.
 upstream_job_id="${UPSTREAM_JOB_ID-5125968}"
 preflight_job_id="${PREFLIGHT_JOB_ID:-}"
+prep_job_id="${PREP_JOB_ID:-}"
 skip_preflight="${SKIP_PREFLIGHT:-0}"
 dry_run="${DRY_RUN:-1}"
 confirm="${CONFIRM_FULL_SUBMISSION:-}"
@@ -100,7 +101,7 @@ for boolean_name in dry_run skip_preflight full_production_geometry; do
         exit 2
     fi
 done
-for job_id_name in upstream_job_id preflight_job_id; do
+for job_id_name in upstream_job_id preflight_job_id prep_job_id; do
     job_id_value="${!job_id_name}"
     if [[ -n "$job_id_value" && ! "$job_id_value" =~ ^[0-9]+$ ]]; then
         echo "$job_id_name must be numeric or empty; got '$job_id_value'." >&2
@@ -119,8 +120,17 @@ fi
 if [[ "$selection" != preflight && "$dry_run" == 0 ]]; then
     if [[ ! -f "$dataset_path/dataset_dict.json" \
         || ! -f "$dataset_path/optibertneo_manifest.json" ]]; then
-        echo "Prepared FineWeb-Edu DatasetDict is incomplete: $dataset_path" >&2
-        exit 2
+        if [[ -z "$prep_job_id" ]]; then
+            echo "Prepared FineWeb-Edu DatasetDict is incomplete: $dataset_path" >&2
+            [[ -f "$dataset_path/dataset_dict.json" ]] \
+                || echo "  missing: $dataset_path/dataset_dict.json" >&2
+            [[ -f "$dataset_path/optibertneo_manifest.json" ]] \
+                || echo "  missing: $dataset_path/optibertneo_manifest.json" >&2
+            echo "Prepare it with jobs/scaled_fineweb/prepare-horeka.sbatch, then rerun." >&2
+            echo "Or pass PREP_JOB_ID=<successful preparation job> to queue training behind it." >&2
+            exit 2
+        fi
+        echo "Dataset is incomplete now; training will wait for PREP_JOB_ID=$prep_job_id." >&2
     fi
 fi
 for exported_value in "$source" "$neobert_root" "$complex_attention_root" \
@@ -137,6 +147,11 @@ for required_job in "$job_dir/preflight-horeka-a100.sbatch" \
         exit 2
     fi
 done
+if [[ "$dry_run" == 0 && -n "$prep_job_id" \
+    && ! -f "$job_dir/prepare-horeka.sbatch" ]]; then
+    echo "PREP_JOB_ID was supplied but preparation job file is missing: $job_dir/prepare-horeka.sbatch" >&2
+    exit 2
+fi
 if [[ "$dry_run" == 0 && ! -x "$mamba_exe" ]]; then
     echo "MAMBA_EXE is not executable: $mamba_exe" >&2
     exit 2
@@ -209,10 +224,18 @@ if [[ "$selection" == preflight ]]; then
 fi
 
 initial_dependency=""
+initial_dependency_ids=()
 if [[ -n "$preflight_dependency" ]]; then
-    initial_dependency="$preflight_dependency"
-elif [[ -n "$upstream_job_id" ]]; then
-    initial_dependency="$upstream_job_id"
+    initial_dependency_ids+=("$preflight_dependency")
+fi
+if [[ -n "$prep_job_id" ]]; then
+    initial_dependency_ids+=("$prep_job_id")
+fi
+if ((${#initial_dependency_ids[@]} == 0)) && [[ -n "$upstream_job_id" ]]; then
+    initial_dependency_ids+=("$upstream_job_id")
+fi
+if ((${#initial_dependency_ids[@]} > 0)); then
+    initial_dependency="$(IFS=:; printf '%s' "${initial_dependency_ids[*]}")"
 fi
 
 all_training_ids=()
